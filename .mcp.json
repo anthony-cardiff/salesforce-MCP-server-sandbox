@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "salesforce-sandbox": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/Users/anthonyd/mcpServer/salesforce/dist/index.js"
+      ],
+      "env": {}
+    }
+  }
+}
