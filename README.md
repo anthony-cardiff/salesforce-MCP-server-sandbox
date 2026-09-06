@@ -108,6 +108,17 @@ All tools are prefixed `salesforce_` (plus a `ping` health check). Tools marked 
 - **`salesforce_get_user_permission_assignments`** — permission sets/groups assigned to a user.
 - **`salesforce_explain_user_access`** — combines the above to explain *why* a specific user can (or can't) access a given object.
 
+### Advanced reasoning tools
+
+These are composite tools: each one fans out across several of the primitive read-only tools above (describe calls, Tooling API queries, permission lookups, dependency search, log/job inspection, etc.) and returns one synthesized report, so the model can reason over a single coherent picture instead of stitching together many separate tool calls itself.
+
+- **`salesforce_explain_object`** — full technical profile of an object: fields, child relationships, record types, validation rules, page layouts, Apex triggers, metadata dependencies, and object permissions, plus summary counts.
+- **`salesforce_explain_field`** — full technical profile of a single field: schema details (type/formula/relationship info), field-level permissions, and metadata dependencies that reference it.
+- **`salesforce_explain_record_access`** — explains one user's access to one specific record by combining effective record access, ownership, profile, permission sets/groups, object permissions, and sharing info.
+- **`salesforce_compare_users`** — diffs two users side by side across profile, role, license, permission sets, permission set groups, and (optionally) object-level permissions on a given object.
+- **`salesforce_find_every_reference`** — broad cross-metadata search for an API name or keyword across Apex classes/triggers, Flows, validation rules, custom fields, layouts, and custom metadata types, in one pass.
+- **`salesforce_diagnose_error`** — takes a raw error message, exception, or component name and cross-references Apex logs, async jobs, Flows, Apex source, validation rules, and metadata dependencies, then heuristically classifies the likely root cause (e.g. `PERMISSIONS_OR_SHARING`, `VALIDATION_RULE`, `FLOW_OR_PROCESS_AUTOMATION`).
+
 ### Writing data
 
 These require an explicit `confirm: true` argument — the model must state the write out loud, it won't happen implicitly.
@@ -116,7 +127,8 @@ These require an explicit `confirm: true` argument — the model must state the 
 - **`salesforce_update_record`** — update one record by ID.
 - **`salesforce_preview_update`** — dry-run a bulk update: runs a `SELECT` and shows current vs. proposed field values for matched records, without writing anything.
 - **`salesforce_prepare_bulk_update`** — validates a proposed bulk update (object writable, fields writable), runs the `SELECT`, and returns an `operationToken` plus a preview. No write happens here either.
-- **`salesforce_execute_bulk_update`** — executes a bulk update previously prepared with `salesforce_prepare_bulk_update`, given its `operationToken` and `confirm: true`. Tokens expire after 15 minutes and are single-use.
+- **`salesforce_execute_bulk_update`** — executes a bulk update previously prepared with `salesforce_prepare_bulk_update`, given its `operationToken` and `confirm: true`. Tokens expire after 15 minutes and are single-use. Before/after values are written to the audit log so the update can be rolled back.
+- **`salesforce_rollback_bulk_update`** — given the `auditId` returned by `salesforce_execute_bulk_update` and `confirm: true`, restores the affected records to the field values captured before that update ran.
 
 ## Usage
 
@@ -136,6 +148,14 @@ Search Apex code for any reference to Federal_Tax_ID_No__c.
 Explain the Lender_Decision_Screen flow.
 
 Preview setting Status__c = 'Closed' on all Contract_Details__c records where Stage__c = 'Expired', then run the bulk update if it looks right.
+
+Give me a full technical profile of the Opportunity object.
+
+Compare user 005XXXXXXXXXXXXAAA and 005YYYYYYYYYYYYAAA — why does one have access I'd expect and the other doesn't?
+
+I'm seeing "INSUFFICIENT_ACCESS_ON_CROSS_REFERENCE_ENTITY" when saving an Opportunity — diagnose it.
+
+Find every place Second_Signer__c is referenced across the org.
 ```
 
 For direct/manual tool calls (e.g. scripting or testing), invoke the tool by name with its documented input, for example:
@@ -149,12 +169,14 @@ For direct/manual tool calls (e.g. scripting or testing), invoke the tool by nam
 
 ### Bulk update flow
 
-Bulk writes are intentionally a two-step, token-gated process so nothing is modified without an explicit preview:
+Bulk writes are intentionally a multi-step, token-gated process so nothing is modified without an explicit preview, and every executed change can be undone:
 
 1. Call `salesforce_prepare_bulk_update` with the object, a `SELECT` query identifying target records, and the fields to change. It validates permissions, previews the affected records, and returns an `operationToken`.
-2. Review the preview, then call `salesforce_execute_bulk_update` with that `operationToken` and `confirm: true` to actually apply the change.
+2. Review the preview, then call `salesforce_execute_bulk_update` with that `operationToken` and `confirm: true` to actually apply the change. It returns an `auditId` and the pre-update field values are persisted to the audit log.
+3. If needed, call `salesforce_rollback_bulk_update` with that `auditId` and `confirm: true` to restore the affected records to their prior values.
 
 ## Notes
 
 - Only `SELECT` statements are accepted by the query tools — no DML can be smuggled in through `salesforce_query` or `salesforce_tooling_query`.
 - `dist/`, `node_modules/`, `logs/`, and `.env` are gitignored; run `npm install` and `npx tsc` after cloning before the server will run.
+- Bulk update audit records (used by `salesforce_rollback_bulk_update`) are appended to `logs/bulk-updates.jsonl`, created automatically on first execute.

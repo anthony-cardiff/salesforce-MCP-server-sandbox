@@ -1,8 +1,12 @@
 import { McpServer } from '@modelcontextprotocol/server';
 import { serveStdio } from '@modelcontextprotocol/server/stdio';
+import fs from 'node:fs/promises';
+import path from 'node:path';
 import crypto from 'node:crypto';
 import * as z from 'zod/v4';
 import { getSalesforceConnection } from './salesforce.js';
+
+/**********************    HELPER FUNCTION    **********************/ 
 
 function jsonResult(value: unknown) {
   return {
@@ -62,6 +66,377 @@ function summarizeFlowMetadata(metadata: any) {
   };
 }
 
+/******************************************************************************/
+/**********************    Salesforce Get Flow Graph    **********************/ 
+/****************************************************************************/ 
+
+function flowElementName(element: any): string | null {
+  return element?.name ?? null;
+}
+
+function getConnectorTarget(connector: any): string | null {
+  if (!connector) {
+    return null;
+  }
+
+  return (
+    connector.targetReference ??
+    connector.targetElementReference ??
+    null
+  );
+}
+
+function collectFlowGraph(metadata: any) {
+  const nodes: any[] = [];
+  const edges: any[] = [];
+
+  const addNode = (
+    type: string,
+    element: any,
+    extra: Record<string, unknown> = {}
+  ) => {
+    const name = flowElementName(element);
+
+    if (!name) {
+      return;
+    }
+
+    nodes.push({
+      id: name,
+      type,
+      label: element.label ?? name,
+      ...extra,
+    });
+
+    const connectorTarget = getConnectorTarget(
+      element.connector
+    );
+
+    if (connectorTarget) {
+      edges.push({
+        from: name,
+        to: connectorTarget,
+        type: 'connector',
+      });
+    }
+
+    const faultTarget = getConnectorTarget(
+      element.faultConnector
+    );
+
+    if (faultTarget) {
+      edges.push({
+        from: name,
+        to: faultTarget,
+        type: 'fault',
+      });
+    }
+  };
+
+  // ------------------------------------------------------------
+  // START
+  // ------------------------------------------------------------
+
+  if (metadata?.start) {
+    nodes.push({
+      id: '__START__',
+      type: 'start',
+      label: 'Start',
+      object: metadata.start.object ?? null,
+      triggerType: metadata.start.triggerType ?? null,
+      recordTriggerType:
+        metadata.start.recordTriggerType ?? null,
+    });
+
+    const target = getConnectorTarget(
+      metadata.start.connector
+    );
+
+    if (target) {
+      edges.push({
+        from: '__START__',
+        to: target,
+        type: 'start',
+      });
+    }
+  }
+
+  // ------------------------------------------------------------
+  // SCREENS
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.screens ?? []) {
+    addNode('screen', element, {
+      allowBack: element.allowBack,
+      allowFinish: element.allowFinish,
+      allowPause: element.allowPause,
+      fields:
+        element.fields?.map((field: any) => ({
+          name: field.name,
+          fieldType: field.fieldType,
+          dataType: field.dataType,
+        })) ?? [],
+    });
+  }
+
+  // ------------------------------------------------------------
+  // ASSIGNMENTS
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.assignments ?? []) {
+    addNode('assignment', element, {
+      assignments:
+        element.assignmentItems?.map((item: any) => ({
+          assignToReference:
+            item.assignToReference,
+          operator: item.operator,
+          value: item.value,
+        })) ?? [],
+    });
+  }
+
+  // ------------------------------------------------------------
+  // RECORD LOOKUPS
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.recordLookups ?? []) {
+    addNode('recordLookup', element, {
+      object: element.object,
+      assignNullValuesIfNoRecordsFound:
+        element.assignNullValuesIfNoRecordsFound,
+      getFirstRecordOnly:
+        element.getFirstRecordOnly,
+      filters: element.filters ?? [],
+      outputAssignments:
+        element.outputAssignments ?? [],
+    });
+  }
+
+  // ------------------------------------------------------------
+  // RECORD CREATES
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.recordCreates ?? []) {
+    addNode('recordCreate', element, {
+      object: element.object,
+      inputAssignments:
+        element.inputAssignments ?? [],
+      inputReference:
+        element.inputReference ?? null,
+    });
+  }
+
+  // ------------------------------------------------------------
+  // RECORD UPDATES
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.recordUpdates ?? []) {
+    addNode('recordUpdate', element, {
+      object: element.object,
+      filters: element.filters ?? [],
+      inputAssignments:
+        element.inputAssignments ?? [],
+      inputReference:
+        element.inputReference ?? null,
+    });
+  }
+
+  // ------------------------------------------------------------
+  // RECORD DELETES
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.recordDeletes ?? []) {
+    addNode('recordDelete', element, {
+      object: element.object,
+      filters: element.filters ?? [],
+      inputReference:
+        element.inputReference ?? null,
+    });
+  }
+
+  // ------------------------------------------------------------
+  // DECISIONS
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.decisions ?? []) {
+    const name = flowElementName(element);
+
+    if (!name) {
+      continue;
+    }
+
+    nodes.push({
+      id: name,
+      type: 'decision',
+      label: element.label ?? name,
+      defaultConnectorLabel:
+        element.defaultConnectorLabel ?? null,
+    });
+
+    for (const rule of element.rules ?? []) {
+      const target = getConnectorTarget(
+        rule.connector
+      );
+
+      if (target) {
+        edges.push({
+          from: name,
+          to: target,
+          type: 'decisionRule',
+          label: rule.label ?? rule.name,
+          ruleName: rule.name,
+          conditionLogic:
+            rule.conditionLogic ?? null,
+          conditions:
+            rule.conditions ?? [],
+        });
+      }
+    }
+
+    const defaultTarget = getConnectorTarget(
+      element.defaultConnector
+    );
+
+    if (defaultTarget) {
+      edges.push({
+        from: name,
+        to: defaultTarget,
+        type: 'decisionDefault',
+        label:
+          element.defaultConnectorLabel ??
+          'Default',
+      });
+    }
+  }
+
+  // ------------------------------------------------------------
+  // LOOPS
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.loops ?? []) {
+    const name = flowElementName(element);
+
+    if (!name) {
+      continue;
+    }
+
+    nodes.push({
+      id: name,
+      type: 'loop',
+      label: element.label ?? name,
+      collectionReference:
+        element.collectionReference ?? null,
+      iterationOrder:
+        element.iterationOrder ?? null,
+    });
+
+    const nextTarget = getConnectorTarget(
+      element.nextValueConnector
+    );
+
+    if (nextTarget) {
+      edges.push({
+        from: name,
+        to: nextTarget,
+        type: 'loopNext',
+      });
+    }
+
+    const noMoreTarget = getConnectorTarget(
+      element.noMoreValuesConnector
+    );
+
+    if (noMoreTarget) {
+      edges.push({
+        from: name,
+        to: noMoreTarget,
+        type: 'loopDone',
+      });
+    }
+  }
+
+  // ------------------------------------------------------------
+  // SUBFLOWS
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.subflows ?? []) {
+    addNode('subflow', element, {
+      flowName:
+        element.flowName ?? null,
+      inputAssignments:
+        element.inputAssignments ?? [],
+      outputAssignments:
+        element.outputAssignments ?? [],
+    });
+  }
+
+  // ------------------------------------------------------------
+  // ACTION CALLS
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.actionCalls ?? []) {
+    addNode('actionCall', element, {
+      actionName:
+        element.actionName ?? null,
+      actionType:
+        element.actionType ?? null,
+      inputParameters:
+        element.inputParameters ?? [],
+      outputParameters:
+        element.outputParameters ?? [],
+    });
+  }
+
+  // ------------------------------------------------------------
+  // COLLECTION PROCESSORS
+  // ------------------------------------------------------------
+
+  for (
+    const element of
+    metadata?.collectionProcessors ?? []
+  ) {
+    addNode('collectionProcessor', element, {
+      collectionProcessorType:
+        element.collectionProcessorType ?? null,
+      collectionReference:
+        element.collectionReference ?? null,
+    });
+  }
+
+  // ------------------------------------------------------------
+  // WAITS / PAUSES
+  // ------------------------------------------------------------
+
+  for (const element of metadata?.waits ?? []) {
+    addNode('wait', element, {
+      waitEvents:
+        element.waitEvents ?? [],
+    });
+  }
+
+  return {
+    nodes,
+    edges,
+    summary: {
+      nodeCount: nodes.length,
+      edgeCount: edges.length,
+      nodeTypes: nodes.reduce(
+        (
+          acc: Record<string, number>,
+          node: any
+        ) => {
+          acc[node.type] =
+            (acc[node.type] ?? 0) + 1;
+
+          return acc;
+        },
+        {}
+      ),
+    },
+  };
+}
+
+
 const pendingBulkUpdates = new Map<
   string,
   {
@@ -71,6 +446,17 @@ const pendingBulkUpdates = new Map<
     createdAt: number;
   }
 >();
+
+const auditLogPath = path.resolve('logs', 'bulk-updates.jsonl');
+
+async function appendAuditLog(entry: unknown) {
+  await fs.mkdir(path.dirname(auditLogPath), { recursive: true });
+  await fs.appendFile(
+    auditLogPath,
+    JSON.stringify(entry) + '\n',
+    'utf8'
+  );
+}
 
 function createOperationToken() {
   return crypto.randomUUID();
@@ -1655,84 +2041,2247 @@ function createServer() {
     }
   );
 
+server.registerTool(
+  'salesforce_execute_bulk_update',
+  {
+    description:
+      'Execute a previously prepared Salesforce bulk update using its operation token and save rollback data to the audit log.',
+    inputSchema: z.object({
+      operationToken: z.string(),
+      confirm: z.literal(true),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: false,
+    },
+  },
+  async ({ operationToken, confirm }) => {
+    if (confirm !== true) {
+      throw new Error('Bulk update was not explicitly confirmed.');
+    }
+
+    const operation = pendingBulkUpdates.get(operationToken);
+
+    if (!operation) {
+      throw new Error(
+        'Operation token is invalid, expired, or belongs to a previous MCP process.'
+      );
+    }
+
+    const ageMs = Date.now() - operation.createdAt;
+
+    if (ageMs > 15 * 60 * 1000) {
+      pendingBulkUpdates.delete(operationToken);
+      throw new Error('Operation token expired.');
+    }
+
+    const conn = await getSalesforceConnection();
+
+    const fieldsToCapture = [
+      'Id',
+      ...Object.keys(operation.proposedFields),
+    ];
+
+    const idList = operation.recordIds
+      .map((id) => `'${escapeSoql(id)}'`)
+      .join(',');
+
+    const beforeResult = await conn.query(`
+      SELECT ${fieldsToCapture.join(', ')}
+      FROM ${operation.objectName}
+      WHERE Id IN (${idList})
+    `);
+
+    const beforeRecords = beforeResult.records as any[];
+
+    const recordsToUpdate = operation.recordIds.map((recordId) => ({
+      Id: recordId,
+      ...operation.proposedFields,
+    }));
+
+    const results = await conn
+      .sobject(operation.objectName)
+      .update(recordsToUpdate);
+
+    const normalizedResults = Array.isArray(results)
+      ? results
+      : [results];
+
+    const successes = normalizedResults.filter(
+      (result: any) => result.success
+    );
+
+    const failures = normalizedResults.filter(
+      (result: any) => !result.success
+    );
+
+    const auditId = crypto.randomUUID();
+
+    await appendAuditLog({
+      auditId,
+      timestamp: new Date().toISOString(),
+      objectName: operation.objectName,
+      proposedFields: operation.proposedFields,
+      beforeRecords,
+      attempted: recordsToUpdate.length,
+      succeeded: successes.length,
+      failed: failures.length,
+      results: normalizedResults,
+    });
+
+    pendingBulkUpdates.delete(operationToken);
+
+    return jsonResult({
+      auditId,
+      objectName: operation.objectName,
+      attempted: recordsToUpdate.length,
+      succeeded: successes.length,
+      failed: failures.length,
+      rollbackAvailable: successes.length > 0,
+      message:
+        'Bulk update executed and original values were saved for rollback.',
+    });
+  }
+);
+
+server.registerTool(
+  'salesforce_rollback_bulk_update',
+  {
+    description:
+      'Rollback a previously executed bulk update using its audit ID.',
+    inputSchema: z.object({
+      auditId: z.string(),
+      confirm: z.literal(true),
+    }),
+    annotations: {
+      readOnlyHint: false,
+      destructiveHint: true,
+    },
+  },
+  async ({ auditId, confirm }) => {
+    if (confirm !== true) {
+      throw new Error('Rollback was not explicitly confirmed.');
+    }
+
+    const contents = await fs.readFile(auditLogPath, 'utf8');
+
+    const entries = contents
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line));
+
+    const audit = entries.find(
+      (entry) => entry.auditId === auditId
+    );
+
+    if (!audit) {
+      throw new Error(`Audit record not found: ${auditId}`);
+    }
+
+    const conn = await getSalesforceConnection();
+
+    const rollbackRecords = audit.beforeRecords.map(
+      (record: Record<string, unknown>) => {
+        const clean: Record<string, unknown> = {
+          Id: record.Id,
+        };
+
+        for (const fieldName of Object.keys(audit.proposedFields)) {
+          clean[fieldName] = record[fieldName];
+        }
+
+        return clean;
+      }
+    );
+
+    const results = await conn
+      .sobject(audit.objectName)
+      .update(rollbackRecords);
+
+    return jsonResult({
+      auditId,
+      objectName: audit.objectName,
+      recordsAttempted: rollbackRecords.length,
+      results,
+      rolledBack: true,
+    });
+  }
+);
+
+
+/* ############################################################## */
+/*              HIGHER - LEVEL REASONING TOOLS                    */
+/* ############################################################## */
+
+
+////////////////////////////////////////
+//    Salesforce Explain Object       //
+////////////////////////////////////////
+
   server.registerTool(
-    'salesforce_execute_bulk_update',
+    'salesforce_explain_object',
     {
       description:
-        'Execute a previously prepared Salesforce bulk update using its operation token.',
+        'Build a comprehensive technical overview of a Salesforce object, including fields, relationships, record types, validation rules, layouts, triggers, flows, and object permissions.',
       inputSchema: z.object({
-        operationToken: z
+        objectName: z
           .string()
-          .describe('Operation token returned by salesforce_prepare_bulk_update'),
-        confirm: z
-          .literal(true)
-          .describe('Must explicitly be true to execute the write'),
+          .describe(
+            'Salesforce object API name, such as Opportunity or Contract_Details__c'
+          ),
       }),
       annotations: {
-        readOnlyHint: false,
-        destructiveHint: false,
+        readOnlyHint: true,
       },
     },
-    async ({ operationToken, confirm }) => {
-      if (confirm !== true) {
-        throw new Error('Bulk update was not explicitly confirmed.');
-      }
+    async ({ objectName }) => {
+      const conn = await getSalesforceConnection();
+      const safeObject = escapeSoql(objectName);
 
-      const operation = pendingBulkUpdates.get(operationToken);
+      const output: Record<string, unknown> = {
+        objectName,
+      };
 
-      if (!operation) {
-        throw new Error(
-          'Operation token is invalid, expired, or was created by a previous MCP process.'
+      // ------------------------------------------------------------
+      // 1. OBJECT + FIELD DESCRIPTION
+      // ------------------------------------------------------------
+
+      try {
+        const description = await conn.sobject(objectName).describe();
+
+        output.object = {
+          name: description.name,
+          label: description.label,
+          labelPlural: description.labelPlural,
+          custom: description.custom,
+          createable: description.createable,
+          updateable: description.updateable,
+          deletable: description.deletable,
+          queryable: description.queryable,
+          searchable: description.searchable,
+          recordTypeInfos: description.recordTypeInfos,
+        };
+
+        output.fields = description.fields.map((field) => ({
+          name: field.name,
+          label: field.label,
+          type: field.type,
+          custom: field.custom,
+          length: field.length,
+          precision: field.precision,
+          scale: field.scale,
+          required: !field.nillable && !field.defaultedOnCreate,
+          nillable: field.nillable,
+          createable: field.createable,
+          updateable: field.updateable,
+          calculated: field.calculated,
+          calculatedFormula: field.calculatedFormula,
+          referenceTo: field.referenceTo,
+          relationshipName: field.relationshipName,
+          unique: field.unique,
+          externalId: field.externalId,
+        }));
+
+        output.childRelationships = description.childRelationships.map(
+          (relationship) => ({
+            childObject: relationship.childSObject,
+            field: relationship.field,
+            relationshipName: relationship.relationshipName,
+            cascadeDelete: relationship.cascadeDelete,
+            restrictedDelete: relationship.restrictedDelete,
+          })
         );
+      } catch (error) {
+        output.describeError = normalizeSalesforceError(error);
       }
 
-      const ageMs = Date.now() - operation.createdAt;
-      const maxAgeMs = 15 * 60 * 1000;
+      // ------------------------------------------------------------
+      // 2. RECORD TYPES
+      // ------------------------------------------------------------
 
-      if (ageMs > maxAgeMs) {
-        pendingBulkUpdates.delete(operationToken);
-
-        throw new Error(
-          'Operation token expired. Prepare the bulk update again.'
-        );
+      try {
+        output.recordTypes = await conn.query(`
+          SELECT Id,
+                 Name,
+                 DeveloperName,
+                 SobjectType,
+                 IsActive,
+                 BusinessProcessId
+          FROM RecordType
+          WHERE SobjectType = '${safeObject}'
+          ORDER BY Name
+        `);
+      } catch (error) {
+        output.recordTypesError = normalizeSalesforceError(error);
       }
 
+      // ------------------------------------------------------------
+      // 3. ENTITY DEFINITION
+      // ------------------------------------------------------------
+
+      let entityDefinitionId: string | null = null;
+
+      try {
+        const entityResult = await conn.tooling.query(`
+          SELECT Id,
+                 QualifiedApiName,
+                 Label,
+                 PluralLabel,
+                 IsCustomizable
+          FROM EntityDefinition
+          WHERE QualifiedApiName = '${safeObject}'
+          LIMIT 1
+        `);
+
+        if (entityResult.records.length > 0) {
+          const entity: any = entityResult.records[0];
+          entityDefinitionId = entity.Id;
+          output.entityDefinition = entity;
+        }
+      } catch (error) {
+        output.entityDefinitionError = normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 4. VALIDATION RULES
+      // ------------------------------------------------------------
+
+      if (entityDefinitionId) {
+        try {
+          output.validationRules = await conn.tooling.query(`
+            SELECT Id,
+                   ValidationName,
+                   Active,
+                   Description,
+                   ErrorMessage,
+                   ErrorDisplayField
+            FROM ValidationRule
+            WHERE EntityDefinitionId = '${escapeSoql(entityDefinitionId)}'
+            ORDER BY ValidationName
+          `);
+        } catch (error) {
+          output.validationRulesError = normalizeSalesforceError(error);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 5. PAGE LAYOUTS
+      // ------------------------------------------------------------
+
+      if (entityDefinitionId) {
+        try {
+          output.layouts = await conn.tooling.query(`
+            SELECT Id,
+                   Name,
+                   TableEnumOrId
+            FROM Layout
+            WHERE TableEnumOrId = '${escapeSoql(entityDefinitionId)}'
+            ORDER BY Name
+          `);
+        } catch (error) {
+          output.layoutsError = normalizeSalesforceError(error);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 6. APEX TRIGGERS
+      // ------------------------------------------------------------
+
+      try {
+        output.apexTriggers = await conn.tooling.query(`
+          SELECT Id,
+                 Name,
+                 TableEnumOrId,
+                 ApiVersion,
+                 Status,
+                 UsageBeforeInsert,
+                 UsageAfterInsert,
+                 UsageBeforeUpdate,
+                 UsageAfterUpdate,
+                 UsageBeforeDelete,
+                 UsageAfterDelete,
+                 UsageAfterUndelete
+          FROM ApexTrigger
+          WHERE TableEnumOrId = '${safeObject}'
+          ORDER BY Name
+        `);
+      } catch (error) {
+        output.apexTriggersError = normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 7. FLOWS THAT REFERENCE THE OBJECT
+      //
+      // MetadataComponentDependency is more useful here than simply
+      // looking for flows whose trigger object matches the object.
+      // ------------------------------------------------------------
+
+      try {
+        output.dependencies = await conn.tooling.query(`
+          SELECT MetadataComponentId,
+                 MetadataComponentName,
+                 MetadataComponentType,
+                 RefMetadataComponentId,
+                 RefMetadataComponentName,
+                 RefMetadataComponentType
+          FROM MetadataComponentDependency
+          WHERE RefMetadataComponentName = '${safeObject}'
+             OR MetadataComponentName = '${safeObject}'
+          LIMIT 2000
+        `);
+      } catch (error) {
+        output.dependenciesError = normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 8. OBJECT PERMISSIONS
+      // ------------------------------------------------------------
+
+      try {
+        output.objectPermissions = await conn.query(`
+          SELECT Id,
+                 ParentId,
+                 Parent.Name,
+                 Parent.Label,
+                 Parent.IsOwnedByProfile,
+                 PermissionsRead,
+                 PermissionsCreate,
+                 PermissionsEdit,
+                 PermissionsDelete,
+                 PermissionsViewAllRecords,
+                 PermissionsModifyAllRecords
+          FROM ObjectPermissions
+          WHERE SObjectType = '${safeObject}'
+          ORDER BY Parent.Label
+        `);
+      } catch (error) {
+        output.objectPermissionsError = normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 9. SUMMARY COUNTS
+      // ------------------------------------------------------------
+
+      const fields = Array.isArray(output.fields)
+        ? (output.fields as any[])
+        : [];
+
+      const dependencies: any = output.dependencies;
+
+      output.summary = {
+        totalFields: fields.length,
+        customFields: fields.filter((field) => field.custom).length,
+        calculatedFields: fields.filter((field) => field.calculated).length,
+        lookupOrRelationshipFields: fields.filter(
+          (field) =>
+            Array.isArray(field.referenceTo) &&
+            field.referenceTo.length > 0
+        ).length,
+
+        dependenciesFound:
+          dependencies &&
+          typeof dependencies.totalSize === 'number'
+            ? dependencies.totalSize
+            : null,
+      };
+
+      return jsonResult(output);
+    }
+  );
+
+  
+
+////////////////////////////////////////////////
+//    Salesforce Explain Record Access       //
+//////////////////////////////////////////////
+
+/* ********************************************************************************************* */
+/*   Combines Salesforce's UserRecordAccess with the user's profile, permission sets,           */
+/*   permission-set groups, object permissions,record ownership, and share-table information.  */
+/* ****************************************************************************************** */ 
+
+  server.registerTool(
+    'salesforce_explain_record_access',
+    {
+      description:
+        'Explain a Salesforce user\'s access to a specific record, including effective record access, ownership, profile, permission sets, permission set groups, object permissions, and explicit sharing where available.',
+      inputSchema: z.object({
+        userId: z
+          .string()
+          .describe('Salesforce User ID'),
+        objectName: z
+          .string()
+          .describe('Salesforce object API name such as Opportunity'),
+        recordId: z
+          .string()
+          .describe('Salesforce record ID'),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ userId, objectName, recordId }) => {
       const conn = await getSalesforceConnection();
 
-      const records = operation.recordIds.map((recordId) => ({
-        Id: recordId,
-        ...operation.proposedFields,
-      }));
+      const safeUser = escapeSoql(userId);
+      const safeObject = escapeSoql(objectName);
+      const safeRecord = escapeSoql(recordId);
 
-      const results = await conn
-        .sobject(operation.objectName)
-        .update(records);
+      const output: Record<string, unknown> = {
+        userId,
+        objectName,
+        recordId,
+      };
 
-      pendingBulkUpdates.delete(operationToken);
+      // ------------------------------------------------------------
+      // 1. USER + PROFILE
+      // ------------------------------------------------------------
 
-      const normalizedResults = Array.isArray(results)
-        ? results
-        : [results];
+      let profileId: string | null = null;
 
-      const successes = normalizedResults.filter(
-        (result: any) => result.success
+      try {
+        const result = await conn.query(`
+          SELECT Id,
+                 Name,
+                 Username,
+                 IsActive,
+                 ProfileId,
+                 Profile.Name,
+                 UserRoleId,
+                 UserRole.Name
+          FROM User
+          WHERE Id = '${safeUser}'
+          LIMIT 1
+        `);
+
+        if (result.records.length === 0) {
+          throw new Error(`User not found: ${userId}`);
+        }
+
+        const user: any = result.records[0];
+        profileId = user.ProfileId;
+
+        output.user = user;
+      } catch (error) {
+        output.userError = normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 2. EFFECTIVE RECORD ACCESS
+      // Salesforce calculates the final answer for this user/record.
+      // ------------------------------------------------------------
+
+      try {
+        output.effectiveRecordAccess = await conn.query(`
+          SELECT RecordId,
+                 HasReadAccess,
+                 HasEditAccess,
+                 HasDeleteAccess,
+                 HasTransferAccess,
+                 HasAllAccess
+          FROM UserRecordAccess
+          WHERE UserId = '${safeUser}'
+          AND RecordId = '${safeRecord}'
+        `);
+      } catch (error) {
+        output.effectiveRecordAccessError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 3. RECORD + OWNER
+      // ------------------------------------------------------------
+
+      try {
+        const description = await conn.sobject(objectName).describe();
+
+        const fieldNames = new Set(
+          description.fields.map((field) => field.name)
+        );
+
+        const selectFields = ['Id'];
+
+        if (fieldNames.has('Name')) {
+          selectFields.push('Name');
+        }
+
+        if (fieldNames.has('OwnerId')) {
+          selectFields.push('OwnerId', 'Owner.Name');
+        }
+
+        if (fieldNames.has('RecordTypeId')) {
+          selectFields.push(
+            'RecordTypeId',
+            'RecordType.Name',
+            'RecordType.DeveloperName'
+          );
+        }
+
+        const recordResult = await conn.query(`
+          SELECT ${selectFields.join(', ')}
+          FROM ${objectName}
+          WHERE Id = '${safeRecord}'
+          LIMIT 1
+        `);
+
+        if (recordResult.records.length === 0) {
+          throw new Error(
+            `Record ${recordId} not found on ${objectName}`
+          );
+        }
+
+        output.record = recordResult.records[0];
+      } catch (error) {
+        output.recordError = normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 4. USER'S PERMISSION SET ASSIGNMENTS
+      // ------------------------------------------------------------
+
+      let assignedPermissionSetIds: string[] = [];
+
+      try {
+        const assignments = await conn.query(`
+          SELECT Id,
+                 PermissionSetId,
+                 PermissionSet.Name,
+                 PermissionSet.Label,
+                 PermissionSet.IsOwnedByProfile,
+                 PermissionSetGroupId,
+                 PermissionSetGroup.DeveloperName,
+                 PermissionSetGroup.MasterLabel
+          FROM PermissionSetAssignment
+          WHERE AssigneeId = '${safeUser}'
+        `);
+
+        output.permissionAssignments = assignments;
+
+        assignedPermissionSetIds = (assignments.records as any[])
+          .map((record) => record.PermissionSetId)
+          .filter(Boolean);
+      } catch (error) {
+        output.permissionAssignmentsError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 5. PROFILE'S UNDERLYING PERMISSION SET
+      // ------------------------------------------------------------
+
+      let profilePermissionSetIds: string[] = [];
+
+      if (profileId) {
+        try {
+          const profilePermissionSets = await conn.query(`
+            SELECT Id,
+                   Name,
+                   Label,
+                   ProfileId
+            FROM PermissionSet
+            WHERE ProfileId = '${escapeSoql(profileId)}'
+          `);
+
+          output.profilePermissionSet = profilePermissionSets;
+
+          profilePermissionSetIds =
+            (profilePermissionSets.records as any[]).map(
+              (record) => record.Id
+            );
+        } catch (error) {
+          output.profilePermissionSetError =
+            normalizeSalesforceError(error);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 6. EFFECTIVE OBJECT PERMISSION SOURCES
+      // ------------------------------------------------------------
+
+      const permissionParents = [
+        ...new Set([
+          ...assignedPermissionSetIds,
+          ...profilePermissionSetIds,
+        ]),
+      ];
+
+      if (permissionParents.length > 0) {
+        try {
+          const ids = permissionParents
+            .map((id) => `'${escapeSoql(id)}'`)
+            .join(',');
+
+          output.objectPermissionSources = await conn.query(`
+            SELECT Id,
+                   ParentId,
+                   Parent.Name,
+                   Parent.Label,
+                   Parent.IsOwnedByProfile,
+                   SObjectType,
+                   PermissionsRead,
+                   PermissionsCreate,
+                   PermissionsEdit,
+                   PermissionsDelete,
+                   PermissionsViewAllRecords,
+                   PermissionsModifyAllRecords
+            FROM ObjectPermissions
+            WHERE SObjectType = '${safeObject}'
+            AND ParentId IN (${ids})
+            ORDER BY Parent.Label
+          `);
+        } catch (error) {
+          output.objectPermissionSourcesError =
+            normalizeSalesforceError(error);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 7. SHARING MODEL
+      // ------------------------------------------------------------
+
+      try {
+        const sharing = await conn.tooling.query(`
+          SELECT QualifiedApiName,
+                 InternalSharingModel,
+                 ExternalSharingModel
+          FROM EntityDefinition
+          WHERE QualifiedApiName = '${safeObject}'
+          LIMIT 1
+        `);
+
+        output.sharingModel = sharing;
+      } catch (error) {
+        output.sharingModelError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 8. SHARE TABLE
+      //
+      // Standard objects commonly use ObjectShare.
+      // Custom objects commonly use Object__Share.
+      // Some objects do not expose a share table.
+      // ------------------------------------------------------------
+
+      try {
+        const shareObject =
+          objectName.endsWith('__c')
+            ? objectName.replace(/__c$/, '__Share')
+            : `${objectName}Share`;
+
+        const shareDescription =
+          await conn.sobject(shareObject).describe();
+
+        const shareFields = new Set(
+          shareDescription.fields.map((field) => field.name)
+        );
+
+        const parentField =
+          shareFields.has('ParentId')
+            ? 'ParentId'
+            : shareFields.has(`${objectName}Id`)
+              ? `${objectName}Id`
+              : null;
+
+        if (parentField) {
+          output.shareRecords = await conn.query(`
+            SELECT Id,
+                   ${parentField},
+                   UserOrGroupId,
+                   RowCause
+            FROM ${shareObject}
+            WHERE ${parentField} = '${safeRecord}'
+          `);
+
+          output.shareObject = shareObject;
+        } else {
+          output.shareTableNote =
+            `Share object ${shareObject} exists, but its parent field could not be determined automatically.`;
+        }
+      } catch (error) {
+        output.shareTableNote =
+          `No directly queryable share table was found or accessible for ${objectName}.`;
+
+        output.shareTableError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 9. ACCESS SUMMARY
+      // ------------------------------------------------------------
+
+      const accessResult: any =
+        (output.effectiveRecordAccess as any)?.records?.[0];
+
+      const permissionRecords: any[] =
+        (output.objectPermissionSources as any)?.records ?? [];
+
+      const grantsViewAll = permissionRecords.filter(
+        (permission) => permission.PermissionsViewAllRecords
       );
 
-      const failures = normalizedResults.filter(
-        (result: any) => !result.success
+      const grantsModifyAll = permissionRecords.filter(
+        (permission) => permission.PermissionsModifyAllRecords
       );
+
+      output.accessSummary = {
+        hasReadAccess:
+          accessResult?.HasReadAccess ?? null,
+
+        hasEditAccess:
+          accessResult?.HasEditAccess ?? null,
+
+        hasDeleteAccess:
+          accessResult?.HasDeleteAccess ?? null,
+
+        hasTransferAccess:
+          accessResult?.HasTransferAccess ?? null,
+
+        hasAllAccess:
+          accessResult?.HasAllAccess ?? null,
+
+        viewAllSources: grantsViewAll.map((permission) => ({
+          name: permission.Parent?.Name,
+          label: permission.Parent?.Label,
+          profile: permission.Parent?.IsOwnedByProfile,
+        })),
+
+        modifyAllSources: grantsModifyAll.map((permission) => ({
+          name: permission.Parent?.Name,
+          label: permission.Parent?.Label,
+          profile: permission.Parent?.IsOwnedByProfile,
+        })),
+      };
+
+      return jsonResult(output);
+    }
+  );
+
+
+////////////////////////////////////////
+//    Salesforce Compare Users       //
+//////////////////////////////////////
+
+    server.registerTool(
+    'salesforce_compare_users',
+    {
+      description:
+        'Compare two Salesforce users across profile, role, license, permission sets, permission set groups, and optionally object-level permissions.',
+      inputSchema: z.object({
+        userIdA: z.string().describe('First Salesforce User ID'),
+        userIdB: z.string().describe('Second Salesforce User ID'),
+        objectName: z
+          .string()
+          .optional()
+          .describe(
+            'Optional Salesforce object API name to compare object permissions'
+          ),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ userIdA, userIdB, objectName }) => {
+      const conn = await getSalesforceConnection();
+
+      const safeUserA = escapeSoql(userIdA);
+      const safeUserB = escapeSoql(userIdB);
+
+      async function getUserDetails(userId: string) {
+        const userResult = await conn.query(`
+          SELECT Id,
+                 Name,
+                 Username,
+                 Email,
+                 IsActive,
+                 UserType,
+                 ProfileId,
+                 Profile.Name,
+                 UserRoleId,
+                 UserRole.Name,
+                 UserPermissionsMarketingUser,
+                 UserPermissionsOfflineUser
+          FROM User
+          WHERE Id = '${userId}'
+          LIMIT 1
+        `);
+
+        if (userResult.records.length === 0) {
+          throw new Error(`User not found: ${userId}`);
+        }
+
+        const user: any = userResult.records[0];
+
+        const assignments = await conn.query(`
+          SELECT Id,
+                 PermissionSetId,
+                 PermissionSet.Name,
+                 PermissionSet.Label,
+                 PermissionSet.IsOwnedByProfile,
+                 PermissionSetGroupId,
+                 PermissionSetGroup.DeveloperName,
+                 PermissionSetGroup.MasterLabel
+          FROM PermissionSetAssignment
+          WHERE AssigneeId = '${userId}'
+        `);
+
+        const directPermissionSets = (assignments.records as any[])
+          .filter(
+            (record) =>
+              record.PermissionSetId &&
+              !record.PermissionSet?.IsOwnedByProfile
+          )
+          .map((record) => ({
+            id: record.PermissionSetId,
+            name: record.PermissionSet?.Name,
+            label: record.PermissionSet?.Label,
+          }));
+
+        const permissionSetGroups = (assignments.records as any[])
+          .filter((record) => record.PermissionSetGroupId)
+          .map((record) => ({
+            id: record.PermissionSetGroupId,
+            developerName: record.PermissionSetGroup?.DeveloperName,
+            label: record.PermissionSetGroup?.MasterLabel,
+          }));
+
+        let objectPermissions: unknown = null;
+
+        if (objectName) {
+          const safeObject = escapeSoql(objectName);
+
+          const profilePermissionSetResult = await conn.query(`
+            SELECT Id,
+                   Name,
+                   Label,
+                   ProfileId
+            FROM PermissionSet
+            WHERE ProfileId = '${escapeSoql(user.ProfileId)}'
+          `);
+
+          const parentIds = [
+            ...directPermissionSets.map((ps) => ps.id),
+            ...(profilePermissionSetResult.records as any[]).map(
+              (ps) => ps.Id
+            ),
+          ];
+
+          if (parentIds.length > 0) {
+            const ids = [
+              ...new Set(parentIds),
+            ]
+              .map((id) => `'${escapeSoql(id)}'`)
+              .join(',');
+
+            objectPermissions = await conn.query(`
+              SELECT Id,
+                     ParentId,
+                     Parent.Name,
+                     Parent.Label,
+                     Parent.IsOwnedByProfile,
+                     SObjectType,
+                     PermissionsRead,
+                     PermissionsCreate,
+                     PermissionsEdit,
+                     PermissionsDelete,
+                     PermissionsViewAllRecords,
+                     PermissionsModifyAllRecords
+              FROM ObjectPermissions
+              WHERE SObjectType = '${safeObject}'
+              AND ParentId IN (${ids})
+              ORDER BY Parent.Label
+            `);
+          }
+        }
+
+        return {
+          user,
+          directPermissionSets,
+          permissionSetGroups,
+          objectPermissions,
+        };
+      }
+
+      const [userA, userB] = await Promise.all([
+        getUserDetails(safeUserA),
+        getUserDetails(safeUserB),
+      ]);
+
+      function byKey(
+        items: any[],
+        keyFn: (item: any) => string | undefined
+      ) {
+        const map = new Map<string, any>();
+
+        for (const item of items) {
+          const key = keyFn(item);
+
+          if (key) {
+            map.set(key, item);
+          }
+        }
+
+        return map;
+      }
+
+      const permissionSetsA = byKey(
+        userA.directPermissionSets,
+        (item) => item.name
+      );
+
+      const permissionSetsB = byKey(
+        userB.directPermissionSets,
+        (item) => item.name
+      );
+
+      const groupsA = byKey(
+        userA.permissionSetGroups,
+        (item) => item.developerName
+      );
+
+      const groupsB = byKey(
+        userB.permissionSetGroups,
+        (item) => item.developerName
+      );
+
+      const permissionSetOnlyA = [
+        ...permissionSetsA.keys(),
+      ]
+        .filter((name) => !permissionSetsB.has(name))
+        .map((name) => permissionSetsA.get(name));
+
+      const permissionSetOnlyB = [
+        ...permissionSetsB.keys(),
+      ]
+        .filter((name) => !permissionSetsA.has(name))
+        .map((name) => permissionSetsB.get(name));
+
+      const sharedPermissionSets = [
+        ...permissionSetsA.keys(),
+      ]
+        .filter((name) => permissionSetsB.has(name))
+        .map((name) => permissionSetsA.get(name));
+
+      const groupOnlyA = [...groupsA.keys()]
+        .filter((name) => !groupsB.has(name))
+        .map((name) => groupsA.get(name));
+
+      const groupOnlyB = [...groupsB.keys()]
+        .filter((name) => !groupsA.has(name))
+        .map((name) => groupsB.get(name));
+
+      const sharedGroups = [...groupsA.keys()]
+        .filter((name) => groupsB.has(name))
+        .map((name) => groupsA.get(name));
 
       return jsonResult({
-        objectName: operation.objectName,
-        attempted: records.length,
-        succeeded: successes.length,
-        failed: failures.length,
-        successes,
-        failures,
-        operationTokenConsumed: true,
+        userA: userA.user,
+        userB: userB.user,
+
+        profileComparison: {
+          sameProfile:
+            userA.user.ProfileId === userB.user.ProfileId,
+          userAProfile: {
+            id: userA.user.ProfileId,
+            name: userA.user.Profile?.Name,
+          },
+          userBProfile: {
+            id: userB.user.ProfileId,
+            name: userB.user.Profile?.Name,
+          },
+        },
+
+        roleComparison: {
+          sameRole:
+            userA.user.UserRoleId === userB.user.UserRoleId,
+          userARole: {
+            id: userA.user.UserRoleId,
+            name: userA.user.UserRole?.Name,
+          },
+          userBRole: {
+            id: userB.user.UserRoleId,
+            name: userB.user.UserRole?.Name,
+          },
+        },
+
+        permissionSetComparison: {
+          shared: sharedPermissionSets,
+          onlyUserA: permissionSetOnlyA,
+          onlyUserB: permissionSetOnlyB,
+        },
+
+        permissionSetGroupComparison: {
+          shared: sharedGroups,
+          onlyUserA: groupOnlyA,
+          onlyUserB: groupOnlyB,
+        },
+
+        objectName: objectName ?? null,
+
+        objectPermissions: objectName
+          ? {
+              userA: userA.objectPermissions,
+              userB: userB.objectPermissions,
+            }
+          : null,
       });
     }
   );
+
+
+///////////////////////////////////////////////
+//    Salesforce Find Every Reference       //
+/////////////////////////////////////////////
+
+  server.registerTool(
+    'salesforce_find_every_reference',
+    {
+      description:
+        'Search broadly across Salesforce metadata for references to an API name, field, object, class, flow, or other component.',
+      inputSchema: z.object({
+        search: z
+          .string()
+          .describe(
+            'API name or text to search for, such as Second_Signer__c, Opportunity, or LeadTriggerHandler'
+          ),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ search }) => {
+      const conn = await getSalesforceConnection();
+
+      const safe = escapeSoql(search);
+      const needle = search.toLowerCase();
+
+      const output: Record<string, unknown> = {
+        search,
+      };
+
+      // ------------------------------------------------------------
+      // 1. METADATA DEPENDENCY GRAPH
+      // ------------------------------------------------------------
+
+      try {
+        output.metadataDependencies = await conn.tooling.query(`
+          SELECT MetadataComponentId,
+                 MetadataComponentName,
+                 MetadataComponentType,
+                 RefMetadataComponentId,
+                 RefMetadataComponentName,
+                 RefMetadataComponentType
+          FROM MetadataComponentDependency
+          WHERE MetadataComponentName = '${safe}'
+             OR RefMetadataComponentName = '${safe}'
+             OR MetadataComponentName LIKE '%${safe}%'
+             OR RefMetadataComponentName LIKE '%${safe}%'
+          LIMIT 2000
+        `);
+      } catch (error) {
+        output.metadataDependenciesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 2. APEX CLASSES
+      // ------------------------------------------------------------
+
+      try {
+        const result = await conn.tooling.query(`
+          SELECT Id,
+                 Name,
+                 Body,
+                 ApiVersion,
+                 Status
+          FROM ApexClass
+          ORDER BY Name
+        `);
+
+        output.apexClasses = (result.records as any[])
+          .filter((record) =>
+            String(record.Body ?? '')
+              .toLowerCase()
+              .includes(needle)
+          )
+          .map((record) => ({
+            id: record.Id,
+            name: record.Name,
+            apiVersion: record.ApiVersion,
+            status: record.Status,
+          }));
+      } catch (error) {
+        output.apexClassesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 3. APEX TRIGGERS
+      // ------------------------------------------------------------
+
+      try {
+        const result = await conn.tooling.query(`
+          SELECT Id,
+                 Name,
+                 Body,
+                 TableEnumOrId,
+                 ApiVersion,
+                 Status
+          FROM ApexTrigger
+          ORDER BY Name
+        `);
+
+        output.apexTriggers = (result.records as any[])
+          .filter((record) =>
+            String(record.Body ?? '')
+              .toLowerCase()
+              .includes(needle)
+          )
+          .map((record) => ({
+            id: record.Id,
+            name: record.Name,
+            object: record.TableEnumOrId,
+            apiVersion: record.ApiVersion,
+            status: record.Status,
+          }));
+      } catch (error) {
+        output.apexTriggersError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 4. FLOWS
+      //
+      // We search both flow names and serialized metadata.
+      // ------------------------------------------------------------
+
+      try {
+        const definitions = await conn.tooling.query(`
+          SELECT Id,
+                 DeveloperName,
+                 MasterLabel,
+                 ActiveVersionId,
+                 LatestVersionId,
+                 ProcessType
+          FROM FlowDefinitionView
+          ORDER BY DeveloperName
+        `);
+
+        const matchingFlows: any[] = [];
+
+        for (const definition of definitions.records as any[]) {
+          const nameMatch =
+            String(definition.DeveloperName ?? '')
+              .toLowerCase()
+              .includes(needle) ||
+            String(definition.MasterLabel ?? '')
+              .toLowerCase()
+              .includes(needle);
+
+          const versionId =
+            definition.ActiveVersionId ??
+            definition.LatestVersionId;
+
+          let metadataMatch = false;
+
+          if (versionId) {
+            try {
+              const flowResult = await conn.tooling.query(`
+                SELECT Id,
+                       VersionNumber,
+                       Status,
+                       Metadata
+                FROM Flow
+                WHERE Id = '${escapeSoql(versionId)}'
+                LIMIT 1
+              `);
+
+              const flow: any = flowResult.records[0];
+
+              if (flow?.Metadata) {
+                metadataMatch = JSON.stringify(flow.Metadata)
+                  .toLowerCase()
+                  .includes(needle);
+              }
+            } catch {
+              // Ignore individual Flow retrieval failures.
+            }
+          }
+
+          if (nameMatch || metadataMatch) {
+            matchingFlows.push({
+              id: definition.Id,
+              developerName: definition.DeveloperName,
+              masterLabel: definition.MasterLabel,
+              processType: definition.ProcessType,
+              activeVersionId: definition.ActiveVersionId,
+              latestVersionId: definition.LatestVersionId,
+              nameMatch,
+              metadataMatch,
+            });
+          }
+        }
+
+        output.flows = matchingFlows;
+      } catch (error) {
+        output.flowsError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 5. VALIDATION RULES
+      // ------------------------------------------------------------
+
+      try {
+        const result = await conn.tooling.query(`
+          SELECT Id,
+                 ValidationName,
+                 Active,
+                 Description,
+                 ErrorMessage,
+                 EntityDefinitionId,
+                 Metadata
+          FROM ValidationRule
+        `);
+
+        output.validationRules = (result.records as any[])
+          .filter((record) =>
+            JSON.stringify(record)
+              .toLowerCase()
+              .includes(needle)
+          )
+          .map((record) => ({
+            id: record.Id,
+            name: record.ValidationName,
+            active: record.Active,
+            description: record.Description,
+            errorMessage: record.ErrorMessage,
+            entityDefinitionId:
+              record.EntityDefinitionId,
+          }));
+      } catch (error) {
+        output.validationRulesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 6. CUSTOM FIELD DEFINITIONS / FORMULAS
+      // ------------------------------------------------------------
+
+      try {
+        const result = await conn.tooling.query(`
+          SELECT Id,
+                 DeveloperName,
+                 TableEnumOrId,
+                 DataType,
+                 Metadata
+          FROM CustomField
+        `);
+
+        output.customFields = (result.records as any[])
+          .filter((record) =>
+            JSON.stringify(record)
+              .toLowerCase()
+              .includes(needle)
+          )
+          .map((record) => ({
+            id: record.Id,
+            developerName: record.DeveloperName,
+            object: record.TableEnumOrId,
+            dataType: record.DataType,
+          }));
+      } catch (error) {
+        output.customFieldsError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 7. LAYOUTS
+      // ------------------------------------------------------------
+
+      try {
+        const result = await conn.tooling.query(`
+          SELECT Id,
+                 Name,
+                 TableEnumOrId,
+                 Metadata
+          FROM Layout
+        `);
+
+        output.layouts = (result.records as any[])
+          .filter((record) =>
+            JSON.stringify(record)
+              .toLowerCase()
+              .includes(needle)
+          )
+          .map((record) => ({
+            id: record.Id,
+            name: record.Name,
+            object: record.TableEnumOrId,
+          }));
+      } catch (error) {
+        output.layoutsError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 8. CUSTOM METADATA TYPES
+      // ------------------------------------------------------------
+
+      try {
+        const global = await conn.describeGlobal();
+
+        const matchingTypes = global.sobjects
+          .filter((obj) => obj.name.endsWith('__mdt'))
+          .filter(
+            (obj) =>
+              obj.name.toLowerCase().includes(needle) ||
+              obj.label.toLowerCase().includes(needle)
+          )
+          .map((obj) => ({
+            name: obj.name,
+            label: obj.label,
+          }));
+
+        output.customMetadataTypes = matchingTypes;
+      } catch (error) {
+        output.customMetadataTypesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 9. SUMMARY
+      // ------------------------------------------------------------
+
+      const countArray = (value: unknown) =>
+        Array.isArray(value) ? value.length : null;
+
+      const dependencyCount =
+        (output.metadataDependencies as any)?.totalSize ?? null;
+
+      output.summary = {
+        metadataDependencies: dependencyCount,
+        apexClasses: countArray(output.apexClasses),
+        apexTriggers: countArray(output.apexTriggers),
+        flows: countArray(output.flows),
+        validationRules: countArray(output.validationRules),
+        customFields: countArray(output.customFields),
+        layouts: countArray(output.layouts),
+        customMetadataTypes:
+          countArray(output.customMetadataTypes),
+      };
+
+      return jsonResult(output);
+    }
+  );
+
+
+//////////////////////////////////////////////
+//    Salesforce Find Explain Field       //
+////////////////////////////////////////////
+
+  server.registerTool(
+    'salesforce_explain_field',
+    {
+      description:
+        'Build a comprehensive technical overview of a Salesforce field, including schema details, formula/relationship information, field-level permissions, and metadata dependencies.',
+      inputSchema: z.object({
+        objectName: z
+          .string()
+          .describe('Salesforce object API name'),
+        fieldName: z
+          .string()
+          .describe('Field API name, such as Second_Signer__c'),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ objectName, fieldName }) => {
+      const conn = await getSalesforceConnection();
+
+      const safeObject = escapeSoql(objectName);
+      const fullFieldName = fieldName.includes('.')
+        ? fieldName
+        : `${objectName}.${fieldName}`;
+
+      const safeFullField = escapeSoql(fullFieldName);
+
+      const output: Record<string, unknown> = {
+        objectName,
+        fieldName,
+        fullFieldName,
+      };
+
+      // ------------------------------------------------------------
+      // 1. FIELD DESCRIPTION
+      // ------------------------------------------------------------
+
+      try {
+        const objectDescription =
+          await conn.sobject(objectName).describe();
+
+        const field = objectDescription.fields.find(
+          (item) =>
+            item.name.toLowerCase() === fieldName.toLowerCase()
+        );
+
+        if (!field) {
+          throw new Error(
+            `Field ${fieldName} was not found on ${objectName}.`
+          );
+        }
+
+        output.field = {
+          name: field.name,
+          label: field.label,
+          type: field.type,
+          custom: field.custom,
+          length: field.length,
+          precision: field.precision,
+          scale: field.scale,
+          nillable: field.nillable,
+          required:
+            !field.nillable && !field.defaultedOnCreate,
+          defaultedOnCreate: field.defaultedOnCreate,
+          createable: field.createable,
+          updateable: field.updateable,
+          calculated: field.calculated,
+          calculatedFormula: field.calculatedFormula,
+          referenceTo: field.referenceTo,
+          relationshipName: field.relationshipName,
+          relationshipOrder: field.relationshipOrder,
+          unique: field.unique,
+          externalId: field.externalId,
+          autoNumber: field.autoNumber,
+          defaultValue: field.defaultValue,
+          defaultValueFormula: field.defaultValueFormula,
+          restrictedPicklist: field.restrictedPicklist,
+          picklistValues: field.picklistValues?.map((value) => ({
+            label: value.label,
+            value: value.value,
+            active: value.active,
+            defaultValue: value.defaultValue,
+          })),
+        };
+      } catch (error) {
+        output.fieldDescribeError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 2. ENTITY PARTICLE / FIELD DEFINITION
+      // ------------------------------------------------------------
+
+      try {
+        const entityResult = await conn.tooling.query(`
+          SELECT Id, DurableId, QualifiedApiName
+          FROM EntityDefinition
+          WHERE QualifiedApiName = '${safeObject}'
+          LIMIT 1
+        `);
+
+        if (entityResult.records.length > 0) {
+          const entity: any = entityResult.records[0];
+
+          const fieldResult = await conn.tooling.query(`
+            SELECT DurableId,
+                   QualifiedApiName,
+                   Label,
+                   DataType,
+                   Length,
+                   Precision,
+                   Scale,
+                   IsCalculated,
+                   IsCompound,
+                   IsHighScaleNumber,
+                   ReferenceTo,
+                   RelationshipName
+            FROM FieldDefinition
+            WHERE EntityDefinitionId = '${escapeSoql(entity.Id)}'
+            AND QualifiedApiName = '${escapeSoql(fieldName)}'
+            LIMIT 1
+          `);
+
+          output.fieldDefinition = fieldResult;
+        }
+      } catch (error) {
+        output.fieldDefinitionError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 3. FIELD LEVEL SECURITY
+      // ------------------------------------------------------------
+
+      try {
+        output.fieldPermissions = await conn.query(`
+          SELECT Id,
+                 ParentId,
+                 Parent.Name,
+                 Parent.Label,
+                 Parent.IsOwnedByProfile,
+                 SObjectType,
+                 Field,
+                 PermissionsRead,
+                 PermissionsEdit
+          FROM FieldPermissions
+          WHERE Field = '${safeFullField}'
+          ORDER BY Parent.Label
+        `);
+      } catch (error) {
+        output.fieldPermissionsError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 4. METADATA DEPENDENCIES
+      // ------------------------------------------------------------
+
+      try {
+        output.dependencies = await conn.tooling.query(`
+          SELECT MetadataComponentId,
+                 MetadataComponentName,
+                 MetadataComponentType,
+                 RefMetadataComponentId,
+                 RefMetadataComponentName,
+                 RefMetadataComponentType
+          FROM MetadataComponentDependency
+          WHERE RefMetadataComponentName = '${escapeSoql(fieldName)}'
+             OR MetadataComponentName = '${escapeSoql(fieldName)}'
+             OR RefMetadataComponentName = '${safeFullField}'
+             OR MetadataComponentName = '${safeFullField}'
+          LIMIT 2000
+        `);
+      } catch (error) {
+        output.dependenciesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 5. SEARCH APEX FOR REFERENCES
+      // ------------------------------------------------------------
+
+      try {
+        const classes = await conn.tooling.query(`
+          SELECT Id, Name, Body
+          FROM ApexClass
+          ORDER BY Name
+        `);
+
+        const triggers = await conn.tooling.query(`
+          SELECT Id, Name, Body, TableEnumOrId
+          FROM ApexTrigger
+          ORDER BY Name
+        `);
+
+        const needle = fieldName.toLowerCase();
+
+        output.apexReferences = {
+          classes: (classes.records as any[])
+            .filter((record) =>
+              String(record.Body ?? '')
+                .toLowerCase()
+                .includes(needle)
+            )
+            .map((record) => ({
+              id: record.Id,
+              name: record.Name,
+            })),
+
+          triggers: (triggers.records as any[])
+            .filter((record) =>
+              String(record.Body ?? '')
+                .toLowerCase()
+                .includes(needle)
+            )
+            .map((record) => ({
+              id: record.Id,
+              name: record.Name,
+              object: record.TableEnumOrId,
+            })),
+        };
+      } catch (error) {
+        output.apexReferencesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 6. SEARCH FLOWS
+      // ------------------------------------------------------------
+
+      try {
+        const definitions = await conn.tooling.query(`
+          SELECT Id,
+                 DeveloperName,
+                 MasterLabel,
+                 ActiveVersionId,
+                 LatestVersionId,
+                 ProcessType
+          FROM FlowDefinitionView
+          ORDER BY DeveloperName
+        `);
+
+        const needle = fieldName.toLowerCase();
+        const matchingFlows: any[] = [];
+
+        for (const definition of definitions.records as any[]) {
+          const versionId =
+            definition.ActiveVersionId ??
+            definition.LatestVersionId;
+
+          if (!versionId) {
+            continue;
+          }
+
+          try {
+            const flowResult = await conn.tooling.query(`
+              SELECT Id,
+                     VersionNumber,
+                     Status,
+                     Metadata
+              FROM Flow
+              WHERE Id = '${escapeSoql(versionId)}'
+              LIMIT 1
+            `);
+
+            const flow: any = flowResult.records[0];
+
+            if (
+              flow?.Metadata &&
+              JSON.stringify(flow.Metadata)
+                .toLowerCase()
+                .includes(needle)
+            ) {
+              matchingFlows.push({
+                definitionId: definition.Id,
+                developerName: definition.DeveloperName,
+                masterLabel: definition.MasterLabel,
+                processType: definition.ProcessType,
+                versionId,
+                versionNumber: flow.VersionNumber,
+                status: flow.Status,
+              });
+            }
+          } catch {
+            // Skip individual Flow retrieval errors.
+          }
+        }
+
+        output.flowReferences = matchingFlows;
+      } catch (error) {
+        output.flowReferencesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 7. FORMULA / CUSTOM FIELD REFERENCES
+      // ------------------------------------------------------------
+
+      try {
+        const customFields = await conn.tooling.query(`
+          SELECT Id,
+                 DeveloperName,
+                 TableEnumOrId,
+                 DataType,
+                 Metadata
+          FROM CustomField
+        `);
+
+        const needle = fieldName.toLowerCase();
+
+        output.customFieldReferences =
+          (customFields.records as any[])
+            .filter((record) =>
+              JSON.stringify(record.Metadata ?? {})
+                .toLowerCase()
+                .includes(needle)
+            )
+            .map((record) => ({
+              id: record.Id,
+              developerName: record.DeveloperName,
+              object: record.TableEnumOrId,
+              dataType: record.DataType,
+            }));
+      } catch (error) {
+        output.customFieldReferencesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 8. SUMMARY
+      // ------------------------------------------------------------
+
+      const fieldPermissions: any[] =
+        (output.fieldPermissions as any)?.records ?? [];
+
+      const readableSources = fieldPermissions
+        .filter((item) => item.PermissionsRead)
+        .map((item) => ({
+          name: item.Parent?.Name,
+          label: item.Parent?.Label,
+          profile: item.Parent?.IsOwnedByProfile,
+        }));
+
+      const editableSources = fieldPermissions
+        .filter((item) => item.PermissionsEdit)
+        .map((item) => ({
+          name: item.Parent?.Name,
+          label: item.Parent?.Label,
+          profile: item.Parent?.IsOwnedByProfile,
+        }));
+
+      output.summary = {
+        readablePermissionSources: readableSources,
+        editablePermissionSources: editableSources,
+        flowReferenceCount:
+          Array.isArray(output.flowReferences)
+            ? output.flowReferences.length
+            : null,
+        customFieldReferenceCount:
+          Array.isArray(output.customFieldReferences)
+            ? output.customFieldReferences.length
+            : null,
+        apexClassReferenceCount:
+          Array.isArray(
+            (output.apexReferences as any)?.classes
+          )
+            ? (output.apexReferences as any).classes.length
+            : null,
+        apexTriggerReferenceCount:
+          Array.isArray(
+            (output.apexReferences as any)?.triggers
+          )
+            ? (output.apexReferences as any).triggers.length
+            : null,
+      };
+
+      return jsonResult(output);
+    }
+  );
+
+
+////////////////////////////////////////
+//    Salesforce Diagnose Error      //
+//////////////////////////////////////
+
+  server.registerTool(
+    'salesforce_diagnose_error',
+    {
+      description:
+        'Investigate a Salesforce error, component name, exception, or failure message across Apex logs, async jobs, Flows, Apex source, validation rules, and metadata dependencies.',
+      inputSchema: z.object({
+        errorText: z
+          .string()
+          .describe(
+            'Salesforce error message, exception text, component name, Flow name, Apex class name, or other failure text'
+          ),
+        recentLimit: z
+          .number()
+          .int()
+          .min(1)
+          .max(100)
+          .default(25),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ errorText, recentLimit }) => {
+      const conn = await getSalesforceConnection();
+
+      const safe = escapeSoql(errorText);
+      const needle = errorText.toLowerCase();
+
+      const output: Record<string, unknown> = {
+        errorText,
+        analyzedAt: new Date().toISOString(),
+      };
+
+      // ------------------------------------------------------------
+      // 1. RECENT APEX LOG HEADERS
+      // ------------------------------------------------------------
+
+      try {
+        const logs = await conn.tooling.query(`
+          SELECT Id,
+                 LogUserId,
+                 LogLength,
+                 Request,
+                 Operation,
+                 Status,
+                 StartTime,
+                 DurationMilliseconds
+          FROM ApexLog
+          ORDER BY StartTime DESC
+          LIMIT ${recentLimit}
+        `);
+
+        output.recentApexLogs = logs;
+      } catch (error) {
+        output.recentApexLogsError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 2. RECENT ASYNC APEX JOBS
+      // ------------------------------------------------------------
+
+      try {
+        output.asyncJobs = await conn.query(`
+          SELECT Id,
+                 ApexClassId,
+                 ApexClass.Name,
+                 JobType,
+                 Status,
+                 MethodName,
+                 JobItemsProcessed,
+                 TotalJobItems,
+                 NumberOfErrors,
+                 ExtendedStatus,
+                 CreatedDate,
+                 CompletedDate
+          FROM AsyncApexJob
+          ORDER BY CreatedDate DESC
+          LIMIT ${recentLimit}
+        `);
+      } catch (error) {
+        output.asyncJobsError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 3. APEX CLASSES CONTAINING ERROR TEXT
+      // ------------------------------------------------------------
+
+      try {
+        const classes = await conn.tooling.query(`
+          SELECT Id,
+                 Name,
+                 Body,
+                 ApiVersion,
+                 Status
+          FROM ApexClass
+          ORDER BY Name
+        `);
+
+        output.apexClassMatches =
+          (classes.records as any[])
+            .filter((record) => {
+              const haystack = [
+                record.Name,
+                record.Body,
+              ]
+                .filter(Boolean)
+                .join('\n')
+                .toLowerCase();
+
+              return haystack.includes(needle);
+            })
+            .map((record) => ({
+              id: record.Id,
+              name: record.Name,
+              apiVersion: record.ApiVersion,
+              status: record.Status,
+            }));
+      } catch (error) {
+        output.apexClassMatchesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 4. APEX TRIGGERS CONTAINING ERROR TEXT
+      // ------------------------------------------------------------
+
+      try {
+        const triggers = await conn.tooling.query(`
+          SELECT Id,
+                 Name,
+                 Body,
+                 TableEnumOrId,
+                 ApiVersion,
+                 Status
+          FROM ApexTrigger
+          ORDER BY Name
+        `);
+
+        output.apexTriggerMatches =
+          (triggers.records as any[])
+            .filter((record) => {
+              const haystack = [
+                record.Name,
+                record.Body,
+                record.TableEnumOrId,
+              ]
+                .filter(Boolean)
+                .join('\n')
+                .toLowerCase();
+
+              return haystack.includes(needle);
+            })
+            .map((record) => ({
+              id: record.Id,
+              name: record.Name,
+              object: record.TableEnumOrId,
+              apiVersion: record.ApiVersion,
+              status: record.Status,
+            }));
+      } catch (error) {
+        output.apexTriggerMatchesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 5. FLOW DEFINITIONS + METADATA SEARCH
+      // ------------------------------------------------------------
+
+      try {
+        const definitions = await conn.tooling.query(`
+          SELECT Id,
+                 DeveloperName,
+                 MasterLabel,
+                 ProcessType,
+                 ActiveVersionId,
+                 LatestVersionId
+          FROM FlowDefinitionView
+          ORDER BY DeveloperName
+        `);
+
+        const matchingFlows: any[] = [];
+
+        for (const definition of definitions.records as any[]) {
+          const nameHaystack = [
+            definition.DeveloperName,
+            definition.MasterLabel,
+          ]
+            .filter(Boolean)
+            .join('\n')
+            .toLowerCase();
+
+          const nameMatch = nameHaystack.includes(needle);
+
+          const versionId =
+            definition.ActiveVersionId ??
+            definition.LatestVersionId;
+
+          let metadataMatch = false;
+          let versionNumber: number | null = null;
+          let status: string | null = null;
+
+          if (versionId) {
+            try {
+              const flowResult = await conn.tooling.query(`
+                SELECT Id,
+                       VersionNumber,
+                       Status,
+                       Metadata
+                FROM Flow
+                WHERE Id = '${escapeSoql(versionId)}'
+                LIMIT 1
+              `);
+
+              const flow: any = flowResult.records[0];
+
+              versionNumber = flow?.VersionNumber ?? null;
+              status = flow?.Status ?? null;
+
+              if (flow?.Metadata) {
+                metadataMatch = JSON.stringify(flow.Metadata)
+                  .toLowerCase()
+                  .includes(needle);
+              }
+            } catch {
+              // Ignore individual flow retrieval errors.
+            }
+          }
+
+          if (nameMatch || metadataMatch) {
+            matchingFlows.push({
+              definitionId: definition.Id,
+              developerName: definition.DeveloperName,
+              masterLabel: definition.MasterLabel,
+              processType: definition.ProcessType,
+              activeVersionId: definition.ActiveVersionId,
+              latestVersionId: definition.LatestVersionId,
+              versionNumber,
+              status,
+              nameMatch,
+              metadataMatch,
+            });
+          }
+        }
+
+        output.flowMatches = matchingFlows;
+      } catch (error) {
+        output.flowMatchesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 6. VALIDATION RULE SEARCH
+      // ------------------------------------------------------------
+
+      try {
+        const rules = await conn.tooling.query(`
+          SELECT Id,
+                 ValidationName,
+                 Active,
+                 Description,
+                 ErrorMessage,
+                 EntityDefinitionId,
+                 Metadata
+          FROM ValidationRule
+        `);
+
+        output.validationRuleMatches =
+          (rules.records as any[])
+            .filter((record) =>
+              JSON.stringify(record)
+                .toLowerCase()
+                .includes(needle)
+            )
+            .map((record) => ({
+              id: record.Id,
+              name: record.ValidationName,
+              active: record.Active,
+              description: record.Description,
+              errorMessage: record.ErrorMessage,
+              entityDefinitionId:
+                record.EntityDefinitionId,
+            }));
+      } catch (error) {
+        output.validationRuleMatchesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 7. METADATA DEPENDENCY SEARCH
+      // ------------------------------------------------------------
+
+      try {
+        output.metadataDependencies =
+          await conn.tooling.query(`
+            SELECT MetadataComponentId,
+                   MetadataComponentName,
+                   MetadataComponentType,
+                   RefMetadataComponentId,
+                   RefMetadataComponentName,
+                   RefMetadataComponentType
+            FROM MetadataComponentDependency
+            WHERE MetadataComponentName LIKE '%${safe}%'
+               OR RefMetadataComponentName LIKE '%${safe}%'
+            LIMIT 2000
+          `);
+      } catch (error) {
+        output.metadataDependenciesError =
+          normalizeSalesforceError(error);
+      }
+
+      // ------------------------------------------------------------
+      // 8. HEURISTIC CLASSIFICATION
+      // ------------------------------------------------------------
+
+      const lower = errorText.toLowerCase();
+
+      const classifications: string[] = [];
+
+      if (
+        lower.includes('cannot_execute_flow_trigger') ||
+        lower.includes('flow')
+      ) {
+        classifications.push('FLOW_OR_PROCESS_AUTOMATION');
+      }
+
+      if (
+        lower.includes('apex') ||
+        lower.includes('trigger') ||
+        lower.includes('exception') ||
+        lower.includes('stack trace')
+      ) {
+        classifications.push('APEX_OR_TRIGGER');
+      }
+
+      if (
+        lower.includes('validation') ||
+        lower.includes('field_custom_validation_exception')
+      ) {
+        classifications.push('VALIDATION_RULE');
+      }
+
+      if (
+        lower.includes('insufficient_access') ||
+        lower.includes('insufficient privileges') ||
+        lower.includes('permission')
+      ) {
+        classifications.push('PERMISSIONS_OR_SHARING');
+      }
+
+      if (
+        lower.includes('required_field_missing') ||
+        lower.includes('required field')
+      ) {
+        classifications.push('REQUIRED_FIELD');
+      }
+
+      if (
+        lower.includes('duplicate') ||
+        lower.includes('duplicate_value')
+      ) {
+        classifications.push('DUPLICATE_RULE_OR_UNIQUE_FIELD');
+      }
+
+      if (
+        lower.includes('queryexception') ||
+        lower.includes('invalid_field') ||
+        lower.includes('malformed_query')
+      ) {
+        classifications.push('SOQL_OR_SCHEMA');
+      }
+
+      output.classification =
+        classifications.length > 0
+          ? classifications
+          : ['UNKNOWN'];
+
+      // ------------------------------------------------------------
+      // 9. SUMMARY COUNTS
+      // ------------------------------------------------------------
+
+      output.summary = {
+        apexClassMatches:
+          Array.isArray(output.apexClassMatches)
+            ? output.apexClassMatches.length
+            : null,
+
+        apexTriggerMatches:
+          Array.isArray(output.apexTriggerMatches)
+            ? output.apexTriggerMatches.length
+            : null,
+
+        flowMatches:
+          Array.isArray(output.flowMatches)
+            ? output.flowMatches.length
+            : null,
+
+        validationRuleMatches:
+          Array.isArray(output.validationRuleMatches)
+            ? output.validationRuleMatches.length
+            : null,
+
+        dependencyMatches:
+          (output.metadataDependencies as any)?.totalSize ??
+          null,
+      };
+
+      return jsonResult(output);
+    }
+  );
+
+
+
+
+/********* RETURN SERVER *********/
+
   return server;
 }
 
