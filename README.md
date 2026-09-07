@@ -119,6 +119,20 @@ These are composite tools: each one fans out across several of the primitive rea
 - **`salesforce_find_every_reference`** — broad cross-metadata search for an API name or keyword across Apex classes/triggers, Flows, validation rules, custom fields, layouts, and custom metadata types, in one pass.
 - **`salesforce_diagnose_error`** — takes a raw error message, exception, or component name and cross-references Apex logs, async jobs, Flows, Apex source, validation rules, and metadata dependencies, then heuristically classifies the likely root cause (e.g. `PERMISSIONS_OR_SHARING`, `VALIDATION_RULE`, `FLOW_OR_PROCESS_AUTOMATION`).
 
+### Schema cache
+
+Object `describe()` calls (full field lists, relationships, picklists, permissions) are one of the more expensive things this server asks Salesforce for, and they're also the ones most likely to be requested repeatedly for the same object in a single session — e.g. `salesforce_list_fields` on `Opportunity`, then `salesforce_explain_object` on `Opportunity`, then `salesforce_update_record` against `Opportunity`, all a few tool calls apart. Rather than re-fetching that describe from Salesforce every time, the server keeps an in-memory cache (keyed by object API name, 10-minute TTL) and reuses it across calls. `salesforce_describe_object`, `salesforce_list_fields`, `salesforce_query_custom_metadata`, `salesforce_list_custom_settings`, `salesforce_create_record`, `salesforce_update_record`, `salesforce_prepare_bulk_update`, `salesforce_explain_object`, `salesforce_explain_record_access`, and `salesforce_explain_field` all pull schema through this cache instead of describing independently.
+
+The payoff is fewer round trips to Salesforce (and less exposure to the org's API call limits), not smaller tool responses — a cache hit still returns the same describe data, it just skips the network call to get it. That matters most for the composite "advanced reasoning" tools above, which can otherwise trigger several redundant describes of the same object while assembling one report, and for any multi-step conversation that keeps coming back to the same object.
+
+You generally don't need to do anything for this to work — it's automatic. Three tools exist for when you want visibility or control over it:
+
+- **`salesforce_schema_cache_status`** — read-only — lists what's currently cached, per object, with remaining TTL.
+- **`salesforce_warm_schema_cache`** — read-only — preloads describes for a list of objects (useful before a batch of operations against objects you know you'll need, so the first real call doesn't pay the describe cost).
+- **`salesforce_clear_schema_cache`** — read-only — evicts one object (pass `objectName`) or the whole cache; use this if you've just changed an object's schema in Salesforce (new/changed field, layout, etc.) and want the server to pick it up immediately instead of waiting out the TTL.
+
+The cache lives in process memory only — it's empty on every server restart and isn't shared across separate server processes.
+
 ### Writing data
 
 These require an explicit `confirm: true` argument — the model must state the write out loud, it won't happen implicitly.
@@ -156,6 +170,10 @@ Compare user 005XXXXXXXXXXXXAAA and 005YYYYYYYYYYYYAAA — why does one have acc
 I'm seeing "INSUFFICIENT_ACCESS_ON_CROSS_REFERENCE_ENTITY" when saving an Opportunity — diagnose it.
 
 Find every place Second_Signer__c is referenced across the org.
+
+Warm the schema cache for Account, Contact, and Opportunity before we start.
+
+Show me the current schema cache status.
 ```
 
 For direct/manual tool calls (e.g. scripting or testing), invoke the tool by name with its documented input, for example:
@@ -180,3 +198,4 @@ Bulk writes are intentionally a multi-step, token-gated process so nothing is mo
 - Only `SELECT` statements are accepted by the query tools — no DML can be smuggled in through `salesforce_query` or `salesforce_tooling_query`.
 - `dist/`, `node_modules/`, `logs/`, and `.env` are gitignored; run `npm install` and `npx tsc` after cloning before the server will run.
 - Bulk update audit records (used by `salesforce_rollback_bulk_update`) are appended to `logs/bulk-updates.jsonl`, created automatically on first execute.
+- The schema cache (see [Schema cache](#schema-cache)) is in-memory only, TTLs after 10 minutes, and resets on restart — if you've just edited an object's schema in Salesforce, call `salesforce_clear_schema_cache` rather than waiting for it to expire.
