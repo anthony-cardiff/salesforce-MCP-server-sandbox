@@ -526,13 +526,13 @@ function createOperationToken() {
   return crypto.randomUUID();
 }
 
+/**********************    </ HELPER FUNCTIONS >   **********************/ 
+
 function createServer() {
   const server = new McpServer({
     name: 'salesforce-mcp',
     version: '1.1.0',
   });
-
-/**********************    </ HELPER FUNCTIONS >   **********************/ 
 
   server.registerTool(
     'ping',
