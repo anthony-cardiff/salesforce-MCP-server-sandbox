@@ -5,8 +5,12 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import * as z from 'zod/v4';
 import { getSalesforceConnection } from './salesforce.js';
+import type { 
+  DescribeSObjectResult, 
+  Connection, 
+} from 'jsforce';
 
-/**********************    HELPER FUNCTION    **********************/ 
+/**********************    < HELPER FUNCTIONS >    **********************/ 
 
 function jsonResult(value: unknown) {
   return {
@@ -66,9 +70,8 @@ function summarizeFlowMetadata(metadata: any) {
   };
 }
 
-/******************************************************************************/
-/**********************    Salesforce Get Flow Graph    **********************/ 
-/****************************************************************************/ 
+
+/***** Salesforce Get Flow Graph *****/ 
 
 function flowElementName(element: any): string | null {
   return element?.name ?? null;
@@ -458,9 +461,72 @@ async function appendAuditLog(entry: unknown) {
   );
 }
 
+
+/***** Schema Cache *****/
+
+const schemaCache = new Map<
+  string,
+  {
+    value: DescribeSObjectResult;
+    expiresAt: number;
+  }
+>();
+
+const SCHEMA_CACHE_TTL_MS = 10 * 60 * 1000;
+
+async function getCachedDescribe(
+  conn: Connection,
+  objectName: string
+): Promise<{
+  source: 'cache' | 'salesforce';
+  description: DescribeSObjectResult;
+}> {
+  const key = objectName.toLowerCase();
+  const now = Date.now();
+
+  const cached = schemaCache.get(key);
+
+  if (cached && cached.expiresAt > now) {
+    return {
+      source: 'cache',
+      description: cached.value,
+    };
+  }
+
+  const description = await conn
+    .sobject(objectName)
+    .describe();
+
+  schemaCache.set(key, {
+    value: description,
+    expiresAt: now + SCHEMA_CACHE_TTL_MS,
+  });
+
+  return {
+    source: 'salesforce',
+    description,
+  };
+}
+
+function clearSchemaCache(
+  objectName?: string
+) {
+  if (objectName) {
+    schemaCache.delete(
+      objectName.toLowerCase()
+    );
+
+    return;
+  }
+
+  schemaCache.clear();
+}
+
 function createOperationToken() {
   return crypto.randomUUID();
 }
+
+/**********************    </ HELPER FUNCTIONS >   **********************/ 
 
 function createServer() {
   const server = new McpServer({
@@ -551,9 +617,14 @@ function createServer() {
     },
     async ({ objectName }) => {
       const conn = await getSalesforceConnection();
-      const result = await conn.sobject(objectName).describe();
+     // const result = await conn.sobject(objectName).describe();
+     // return jsonResult(result);
 
-      return jsonResult(result);
+     const cached = await getCachedDescribe(conn, objectName);
+     return jsonResult({ 
+      cacheSource: cached.source,
+      description: cached.description,
+      });
     }
   );
 
@@ -588,7 +659,14 @@ function createServer() {
     },
     async ({ objectName }) => {
       const conn = await getSalesforceConnection();
-      const description = await conn.sobject(objectName).describe();
+      // const description = await conn.sobject(objectName).describe();
+      const cached =
+        await getCachedDescribe(
+          conn,
+          objectName
+        );
+
+      const description = cached.description;
 
       const fields = description.fields.map((field) => ({
         name: field.name,
@@ -1100,7 +1178,13 @@ function createServer() {
 
       const conn = await getSalesforceConnection();
 
-      const description = await conn.sobject(metadataType).describe();
+      // const description = await conn.sobject(metadataType).describe();
+      const cached = await getCachedDescribe(
+        conn,
+        metadataType
+      );
+
+      const description = cached.description;
 
       const fieldNames = description.fields
         .map((field) => field.name)
@@ -1133,9 +1217,21 @@ function createServer() {
 
       const candidates = [];
 
-      for (const obj of global.sobjects.filter((o) => o.custom && o.queryable)) {
-        try {
-          const description = await conn.sobject(obj.name).describe();
+      /** for (const obj of global.sobjects.filter((o) => o.custom && o.queryable)) {
+           try {
+             const description = await conn.sobject(obj.name).describe(); **/
+      for (
+        const obj of global.sobjects.filter(
+          (o) => o.custom && o.queryable
+        )
+) {
+  try {
+    const cached = await getCachedDescribe(
+      conn,
+      obj.name
+    );
+
+    const description = cached.description;
 
           if ((description as any).customSetting) {
             candidates.push({
@@ -1363,9 +1459,16 @@ function createServer() {
       }
 
       const conn = await getSalesforceConnection();
-      const description = await conn.sobject(objectName).describe();
+      // const description = await conn.sobject(objectName).describe();
+      const cached = await getCachedDescribe(
+        conn,
+        objectName
+      );
+
+      const description = cached.description;
 
       if (!description.createable) {
+
         throw new Error(
           `Execution user does not have create access to ${objectName}`
         );
@@ -1409,7 +1512,13 @@ function createServer() {
       }
 
       const conn = await getSalesforceConnection();
-      const description = await conn.sobject(objectName).describe();
+      // const description = await conn.sobject(objectName).describe();
+      const cached = await getCachedDescribe(
+        conn,
+        objectName
+      );
+
+     const description = cached.description;
 
       if (!description.updateable) {
         throw new Error(
@@ -1969,7 +2078,13 @@ function createServer() {
       }
 
       const conn = await getSalesforceConnection();
-      const description = await conn.sobject(objectName).describe();
+      // const description = await conn.sobject(objectName).describe();
+      const cached = await getCachedDescribe(
+        conn,
+        objectName
+      );
+
+      const description = cached.description;
 
       if (!description.updateable) {
         throw new Error(`${objectName} is not updateable by the execution user.`);
@@ -2247,7 +2362,12 @@ server.registerTool(
       // ------------------------------------------------------------
 
       try {
-        const description = await conn.sobject(objectName).describe();
+        // const description = await conn.sobject(objectName).describe();
+        const cached = await getCachedDescribe(conn, objectName );
+
+        const description = cached.description;
+
+        output.schemaCacheSource = cached.source;
 
         output.object = {
           name: description.name,
@@ -2593,8 +2713,14 @@ server.registerTool(
       // ------------------------------------------------------------
 
       try {
-        const description = await conn.sobject(objectName).describe();
+        // const description = await conn.sobject(objectName).describe();
+      const cached = await getCachedDescribe(
+        conn,
+        objectName
+      );
 
+      const description = cached.description;
+        
         const fieldNames = new Set(
           description.fields.map((field) => field.name)
         );
@@ -3518,8 +3644,13 @@ server.registerTool(
       // ------------------------------------------------------------
 
       try {
-        const objectDescription =
-          await conn.sobject(objectName).describe();
+        // const objectDescription = await conn.sobject(objectName).describe();
+        const cached = await getCachedDescribe(
+          conn,
+          objectName
+        );
+
+        const objectDescription = cached.description;
 
         const field = objectDescription.fields.find(
           (item) =>
@@ -4280,7 +4411,164 @@ server.registerTool(
 
 
 
-/********* RETURN SERVER *********/
+//////////////////////////////////////
+//    Salesforce Schema Cache      //
+////////////////////////////////////
+
+// ---------------------
+// 1. Cache Status 
+// ---------------------
+
+  server.registerTool(
+    'salesforce_schema_cache_status',
+    {
+      description:
+        'Show the current Salesforce schema cache status.',
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async () => {
+      const now = Date.now();
+
+      const entries = [
+        ...schemaCache.entries(),
+      ].map(([objectName, entry]) => ({
+        objectName,
+        expiresAt:
+          new Date(
+            entry.expiresAt
+          ).toISOString(),
+        expiresInSeconds:
+          Math.max(
+            0,
+            Math.floor(
+              (entry.expiresAt - now) /
+                1000
+            )
+          ),
+      }));
+
+      return jsonResult({
+        ttlMinutes:
+          SCHEMA_CACHE_TTL_MS /
+          60000,
+        cachedObjects:
+          entries.length,
+        entries,
+      });
+    }
+  );
+
+// -------------------------
+// 2. Manually Clear Cache 
+// -------------------------
+
+  server.registerTool(
+    'salesforce_clear_schema_cache',
+    {
+      description:
+        'Clear cached Salesforce object schema. Optionally clear only one object.',
+      inputSchema: z.object({
+        objectName: z
+          .string()
+          .optional()
+          .describe(
+            'Optional Salesforce object API name. Omit to clear the entire cache.'
+          ),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ objectName }) => {
+      clearSchemaCache(objectName);
+
+      return jsonResult({
+        cleared:
+          objectName ?? 'ALL',
+        remainingObjects:
+          schemaCache.size,
+      });
+    }
+  );
+
+// -------------------------
+// 3. Warm The Cache 
+// -------------------------
+
+  server.registerTool(
+    'salesforce_warm_schema_cache',
+    {
+      description:
+        'Preload Salesforce object descriptions into the schema cache.',
+      inputSchema: z.object({
+        objectNames: z
+          .array(z.string())
+          .min(1)
+          .max(100)
+          .describe(
+            'Salesforce object API names to cache'
+          ),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ objectNames }) => {
+      const conn =
+        await getSalesforceConnection();
+
+      const results: any[] = [];
+
+      for (
+        const objectName
+        of objectNames
+      ) {
+        try {
+          const result =
+            await getCachedDescribe(
+              conn,
+              objectName
+            );
+
+          results.push({
+            objectName,
+            success: true,
+            source:
+              result.source,
+            fieldCount:
+              result.description
+                .fields?.length ??
+              null,
+          });
+        } catch (error) {
+          results.push({
+            objectName,
+            success: false,
+            error:
+              normalizeSalesforceError(
+                error
+              ),
+          });
+        }
+      }
+
+      return jsonResult({
+        cachedObjects:
+          schemaCache.size,
+        results,
+      });
+    }
+  );
+
+
+
+
+// ------------------------------------ //
+// ********   RETURN SERVER   ******** //
+// ---------------------------------- //
+
 
   return server;
 }
