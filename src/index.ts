@@ -528,6 +528,7 @@ function createOperationToken() {
 
 /**********************    </ HELPER FUNCTIONS >   **********************/ 
 
+
 function createServer() {
   const server = new McpServer({
     name: 'salesforce-mcp',
@@ -4562,6 +4563,596 @@ server.registerTool(
     }
   );
 
+
+////////////////////////////////////////
+//    Salesforce Diagnose Error      //
+//////////////////////////////////////
+
+  server.registerTool(
+    'salesforce_inventory_all_user_access',
+    {
+      description:
+        'Inventory effective access assignments for all active Salesforce users, including profiles, roles, licenses, permission sets, permission set groups, and selected high-risk system permissions.',
+      inputSchema: z.object({
+        includeInactiveUsers: z
+          .boolean()
+          .default(false)
+          .describe(
+            'Include inactive Salesforce users. Defaults to false.'
+          ),
+      }),
+      annotations: {
+        readOnlyHint: true,
+      },
+    },
+    async ({ includeInactiveUsers }) => {
+      const conn = await getSalesforceConnection();
+
+      const output: Record<string, unknown> = {};
+
+      // ------------------------------------------------------------
+      // 1. USERS
+      // ------------------------------------------------------------
+
+      const userWhere = includeInactiveUsers
+        ? ''
+        : 'WHERE IsActive = true';
+
+      const usersResult = await conn.query(`
+        SELECT
+          Id,
+          Name,
+          Username,
+          Email,
+          IsActive,
+          UserType,
+          ProfileId,
+          Profile.Name,
+          UserRoleId,
+          UserRole.Name,
+          UserRole.DeveloperName,
+          UserPermissionsMarketingUser,
+          UserPermissionsOfflineUser
+        FROM User
+        ${userWhere}
+        ORDER BY Name
+      `);
+
+      const users = usersResult.records as any[];
+
+      // ------------------------------------------------------------
+      // 2. USER LICENSES THROUGH PROFILE
+      // ------------------------------------------------------------
+
+      const profileIds = [
+        ...new Set(
+          users
+            .map((user) => user.ProfileId)
+            .filter(Boolean)
+        ),
+      ];
+
+      const profileMap = new Map<string, any>();
+
+      if (profileIds.length > 0) {
+        const ids = profileIds
+          .map((id) => `'${escapeSoql(id)}'`)
+          .join(',');
+
+        const profilesResult = await conn.query(`
+          SELECT
+            Id,
+            Name,
+            UserLicenseId,
+            UserLicense.Name
+          FROM Profile
+          WHERE Id IN (${ids})
+        `);
+
+        for (const profile of profilesResult.records as any[]) {
+          profileMap.set(profile.Id, profile);
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 3. PERMISSION SET ASSIGNMENTS
+      // ------------------------------------------------------------
+
+      const userIds = users.map((user) => user.Id);
+
+      const assignmentsByUser =
+        new Map<string, any[]>();
+
+      const permissionSetIds =
+        new Set<string>();
+
+      if (userIds.length > 0) {
+        // Query in chunks so we don't create an enormous IN clause.
+        const chunkSize = 150;
+
+        for (
+          let i = 0;
+          i < userIds.length;
+          i += chunkSize
+        ) {
+          const chunk = userIds.slice(
+            i,
+            i + chunkSize
+          );
+
+          const ids = chunk
+            .map(
+              (id) =>
+                `'${escapeSoql(id)}'`
+            )
+            .join(',');
+
+          const assignments =
+            await conn.query(`
+              SELECT
+                Id,
+                AssigneeId,
+                PermissionSetId,
+                PermissionSet.Name,
+                PermissionSet.Label,
+                PermissionSet.IsOwnedByProfile,
+                PermissionSet.ProfileId,
+                PermissionSetGroupId,
+                PermissionSetGroup.DeveloperName,
+                PermissionSetGroup.MasterLabel
+              FROM PermissionSetAssignment
+              WHERE AssigneeId IN (${ids})
+            `);
+
+          for (
+            const assignment
+            of assignments.records as any[]
+          ) {
+            const existing =
+              assignmentsByUser.get(
+                assignment.AssigneeId
+              ) ?? [];
+
+            existing.push(assignment);
+
+            assignmentsByUser.set(
+              assignment.AssigneeId,
+              existing
+            );
+
+            if (assignment.PermissionSetId) {
+              permissionSetIds.add(
+                assignment.PermissionSetId
+              );
+            }
+          }
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 4. PROFILE-BACKED PERMISSION SETS
+      // ------------------------------------------------------------
+
+      const profilePermissionSets =
+        new Map<string, any>();
+
+      if (profileIds.length > 0) {
+        const ids = profileIds
+          .map((id) => `'${escapeSoql(id)}'`)
+          .join(',');
+
+        const result = await conn.query(`
+          SELECT
+            Id,
+            Name,
+            Label,
+            ProfileId,
+            IsOwnedByProfile
+          FROM PermissionSet
+          WHERE ProfileId IN (${ids})
+        `);
+
+        for (
+          const ps
+          of result.records as any[]
+        ) {
+          if (ps.ProfileId) {
+            profilePermissionSets.set(
+              ps.ProfileId,
+              ps
+            );
+
+            permissionSetIds.add(ps.Id);
+          }
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 5. HIGH-RISK SYSTEM PERMISSIONS
+      //
+      // These are intentionally explicit so we can immediately
+      // identify broad administrative access.
+      // ------------------------------------------------------------
+
+      const permissionSetDetails =
+        new Map<string, any>();
+
+      if (permissionSetIds.size > 0) {
+        const allPermissionSetIds =
+          [...permissionSetIds];
+
+        const chunkSize = 150;
+
+        for (
+          let i = 0;
+          i < allPermissionSetIds.length;
+          i += chunkSize
+        ) {
+          const chunk =
+            allPermissionSetIds.slice(
+              i,
+              i + chunkSize
+            );
+
+          const ids = chunk
+            .map(
+              (id) =>
+                `'${escapeSoql(id)}'`
+            )
+            .join(',');
+
+          const result = await conn.query(`
+            SELECT
+              Id,
+              Name,
+              Label,
+              IsOwnedByProfile,
+              ProfileId,
+              PermissionsModifyAllData,
+              PermissionsViewAllData,
+              PermissionsManageUsers,
+              PermissionsCustomizeApplication,
+              PermissionsAuthorApex,
+              PermissionsManageProfilesPermissionsets,
+              PermissionsViewSetup,
+              PermissionsManageRoles,
+              PermissionsManageSharing,
+              PermissionsTransferAnyEntity,
+              PermissionsPasswordNeverExpires,
+              PermissionsApiEnabled
+            FROM PermissionSet
+            WHERE Id IN (${ids})
+          `);
+
+          for (
+            const ps
+            of result.records as any[]
+          ) {
+            permissionSetDetails.set(
+              ps.Id,
+              ps
+            );
+          }
+        }
+      }
+
+      // ------------------------------------------------------------
+      // 6. BUILD USER ACCESS INVENTORY
+      // ------------------------------------------------------------
+
+      const userInventory =
+        users.map((user) => {
+          const assignments =
+            assignmentsByUser.get(
+              user.Id
+            ) ?? [];
+
+          const profile =
+            profileMap.get(
+              user.ProfileId
+            );
+
+          const profilePermissionSet =
+            profilePermissionSets.get(
+              user.ProfileId
+            );
+
+          const directPermissionSets =
+            assignments
+              .filter(
+                (assignment) =>
+                  assignment.PermissionSetId &&
+                  !assignment
+                    .PermissionSet
+                    ?.IsOwnedByProfile
+              )
+              .map((assignment) => ({
+                id:
+                  assignment.PermissionSetId,
+                name:
+                  assignment
+                    .PermissionSet
+                    ?.Name,
+                label:
+                  assignment
+                    .PermissionSet
+                    ?.Label,
+              }));
+
+          const permissionSetGroups =
+            assignments
+              .filter(
+                (assignment) =>
+                  assignment
+                    .PermissionSetGroupId
+              )
+              .map((assignment) => ({
+                id:
+                  assignment
+                    .PermissionSetGroupId,
+                developerName:
+                  assignment
+                    .PermissionSetGroup
+                    ?.DeveloperName,
+                label:
+                  assignment
+                    .PermissionSetGroup
+                    ?.MasterLabel,
+              }));
+
+          const effectivePermissionSets =
+            [
+              profilePermissionSet?.Id,
+              ...directPermissionSets.map(
+                (ps) => ps.id
+              ),
+            ].filter(Boolean);
+
+          const highRiskSources: any[] = [];
+
+          const highRiskPermissionNames = [
+            'PermissionsModifyAllData',
+            'PermissionsViewAllData',
+            'PermissionsManageUsers',
+            'PermissionsCustomizeApplication',
+            'PermissionsAuthorApex',
+            'PermissionsManageProfilesPermissionsets',
+            'PermissionsViewSetup',
+            'PermissionsManageRoles',
+            'PermissionsManageSharing',
+            'PermissionsTransferAnyEntity',
+            'PermissionsPasswordNeverExpires',
+          ];
+
+          for (
+            const psId
+            of effectivePermissionSets
+          ) {
+            const ps =
+              permissionSetDetails.get(
+                psId
+              );
+
+            if (!ps) {
+              continue;
+            }
+
+            const enabledHighRiskPermissions =
+              highRiskPermissionNames.filter(
+                (permissionName) =>
+                  ps[permissionName] === true
+              );
+
+            if (
+              enabledHighRiskPermissions.length >
+              0
+            ) {
+              highRiskSources.push({
+                permissionSetId:
+                  ps.Id,
+                name:
+                  ps.Name,
+                label:
+                  ps.Label,
+                profileBacked:
+                  ps.IsOwnedByProfile,
+                permissions:
+                  enabledHighRiskPermissions,
+              });
+            }
+          }
+
+          return {
+            id: user.Id,
+            name: user.Name,
+            username: user.Username,
+            email: user.Email,
+            active: user.IsActive,
+            userType: user.UserType,
+
+            profile: {
+              id: user.ProfileId,
+              name:
+                user.Profile?.Name,
+            },
+
+            role: user.UserRoleId
+              ? {
+                  id:
+                    user.UserRoleId,
+                  name:
+                    user.UserRole?.Name,
+                  developerName:
+                    user.UserRole
+                      ?.DeveloperName,
+                }
+              : null,
+
+            license: profile
+              ? {
+                  id:
+                    profile.UserLicenseId,
+                  name:
+                    profile.UserLicense
+                      ?.Name,
+                }
+              : null,
+
+            profilePermissionSet:
+              profilePermissionSet
+                ? {
+                    id:
+                      profilePermissionSet.Id,
+                    name:
+                      profilePermissionSet.Name,
+                    label:
+                      profilePermissionSet.Label,
+                  }
+                : null,
+
+            directPermissionSets,
+
+            permissionSetGroups,
+
+            counts: {
+              directPermissionSets:
+                directPermissionSets.length,
+              permissionSetGroups:
+                permissionSetGroups.length,
+              highRiskSources:
+                highRiskSources.length,
+            },
+
+            highRiskSources,
+          };
+        });
+
+      // ------------------------------------------------------------
+      // 7. PROFILE / ROLE / LICENSE SUMMARY
+      // ------------------------------------------------------------
+
+      const profileCounts =
+        new Map<string, number>();
+
+      const roleCounts =
+        new Map<string, number>();
+
+      const licenseCounts =
+        new Map<string, number>();
+
+      for (
+        const user
+        of userInventory as any[]
+      ) {
+        const profileName =
+          user.profile?.name ??
+          'NONE';
+
+        profileCounts.set(
+          profileName,
+          (profileCounts.get(
+            profileName
+          ) ?? 0) + 1
+        );
+
+        const roleName =
+          user.role?.name ??
+          'NO_ROLE';
+
+        roleCounts.set(
+          roleName,
+          (roleCounts.get(
+            roleName
+          ) ?? 0) + 1
+        );
+
+        const licenseName =
+          user.license?.name ??
+          'UNKNOWN';
+
+        licenseCounts.set(
+          licenseName,
+          (licenseCounts.get(
+            licenseName
+          ) ?? 0) + 1
+        );
+      }
+
+      const highRiskUsers =
+        (userInventory as any[])
+          .filter(
+            (user) =>
+              user.highRiskSources.length >
+              0
+          )
+          .map((user) => ({
+            id: user.id,
+            name: user.name,
+            username: user.username,
+            profile: user.profile,
+            highRiskSources:
+              user.highRiskSources,
+          }));
+
+      output.summary = {
+        totalUsers:
+          userInventory.length,
+
+        profilesInUse:
+          profileCounts.size,
+
+        rolesInUse:
+          roleCounts.size,
+
+        licensesInUse:
+          licenseCounts.size,
+
+        usersWithHighRiskPermissions:
+          highRiskUsers.length,
+      };
+
+      output.profileDistribution =
+        [...profileCounts.entries()]
+          .map(([name, count]) => ({
+            name,
+            count,
+          }))
+          .sort(
+            (a, b) =>
+              b.count - a.count
+          );
+
+      output.roleDistribution =
+        [...roleCounts.entries()]
+          .map(([name, count]) => ({
+            name,
+            count,
+          }))
+          .sort(
+            (a, b) =>
+              b.count - a.count
+          );
+
+      output.licenseDistribution =
+        [...licenseCounts.entries()]
+          .map(([name, count]) => ({
+            name,
+            count,
+          }))
+          .sort(
+            (a, b) =>
+              b.count - a.count
+          );
+
+      output.highRiskUsers =
+        highRiskUsers;
+
+      output.users =
+        userInventory;
+
+      return jsonResult(output);
+    }
+  );
 
 
 
