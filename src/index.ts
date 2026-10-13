@@ -41,6 +41,100 @@ function normalizeSalesforceError(error: unknown) {
   };
 }
 
+/**
+ * Query MetadataComponentDependency by component name.
+ *
+ * The Tooling API only accepts the Id columns in a WHERE clause on this
+ * object (filtering on the *Name columns fails with "... is unknown"), so
+ * names are resolved to Ids first. Standard objects use their own name as
+ * the Id, flows use version Ids (301...), and everything else uses the
+ * normal record Id. Dependencies are fetched in both directions: components
+ * that use the match, and components the match uses.
+ */
+async function queryDependenciesByName(
+  conn: Connection,
+  name: string,
+  match: 'exact' | 'contains'
+) {
+  const safe = escapeSoql(name);
+  const developerName = escapeSoql(name.replace(/__(c|mdt|e|x)$/i, ''));
+  const likeValue = (value: string) =>
+    match === 'exact' ? value : `%${value.replace(/([%_])/g, '\\$1')}%`;
+  const operator = match === 'exact' ? '=' : 'LIKE';
+
+  const lookups: Array<[string, string]> = [
+    ['CustomField', `SELECT Id FROM CustomField WHERE DeveloperName ${operator} '${likeValue(developerName)}' LIMIT 200`],
+    ['CustomObject', `SELECT Id FROM CustomObject WHERE DeveloperName ${operator} '${likeValue(developerName)}' LIMIT 200`],
+    ['ApexClass', `SELECT Id FROM ApexClass WHERE Name ${operator} '${likeValue(safe)}' LIMIT 200`],
+    ['ApexTrigger', `SELECT Id FROM ApexTrigger WHERE Name ${operator} '${likeValue(safe)}' LIMIT 200`],
+    ['ApexPage', `SELECT Id FROM ApexPage WHERE Name ${operator} '${likeValue(safe)}' LIMIT 200`],
+    ['Flow', `SELECT Id FROM Flow WHERE Definition.DeveloperName ${operator} '${likeValue(safe)}' LIMIT 200`],
+  ];
+
+  // Standard objects are keyed by name, so the name itself is a candidate Id.
+  const ids = new Set<string>([name]);
+  const lookupErrors: Record<string, unknown> = {};
+
+  const settled = await Promise.allSettled(
+    lookups.map(([, soql]) => conn.tooling.query(soql))
+  );
+
+  settled.forEach((outcome, index) => {
+    const label = lookups[index][0];
+
+    if (outcome.status === 'fulfilled') {
+      for (const record of outcome.value.records as any[]) {
+        ids.add(record.Id);
+      }
+    } else {
+      lookupErrors[label] = normalizeSalesforceError(outcome.reason);
+    }
+  });
+
+  const columns = `MetadataComponentId,
+               MetadataComponentName,
+               MetadataComponentType,
+               RefMetadataComponentId,
+               RefMetadataComponentName,
+               RefMetadataComponentType`;
+
+  const idList = [...ids];
+  const chunkSize = 100;
+  const rows = new Map<string, any>();
+
+  for (let i = 0; i < idList.length; i += chunkSize) {
+    const inList = idList
+      .slice(i, i + chunkSize)
+      .map((id) => `'${escapeSoql(id)}'`)
+      .join(', ');
+
+    for (const column of ['RefMetadataComponentId', 'MetadataComponentId']) {
+      const result = await conn.tooling.query(`
+        SELECT ${columns}
+        FROM MetadataComponentDependency
+        WHERE ${column} IN (${inList})
+        LIMIT 2000
+      `);
+
+      for (const record of result.records as any[]) {
+        rows.set(
+          `${record.MetadataComponentId}|${record.RefMetadataComponentId}`,
+          record
+        );
+      }
+    }
+  }
+
+  const records = [...rows.values()];
+
+  return {
+    totalSize: records.length,
+    done: true,
+    records,
+    ...(Object.keys(lookupErrors).length > 0 ? { lookupErrors } : {}),
+  };
+}
+
 function summarizeFlowMetadata(metadata: any) {
   return {
     label: metadata?.label,
@@ -1414,20 +1508,12 @@ function createServer() {
     },
     async ({ componentName }) => {
       const conn = await getSalesforceConnection();
-      const safe = componentName.replace(/'/g, "\\'");
 
-      const result = await conn.tooling.query(`
-        SELECT MetadataComponentId,
-               MetadataComponentName,
-               MetadataComponentType,
-               RefMetadataComponentId,
-               RefMetadataComponentName,
-               RefMetadataComponentType
-        FROM MetadataComponentDependency
-        WHERE MetadataComponentName LIKE '%${safe}%'
-           OR RefMetadataComponentName LIKE '%${safe}%'
-        LIMIT 2000
-      `);
+      const result = await queryDependenciesByName(
+        conn,
+        componentName,
+        'contains'
+      );
 
       return jsonResult(result);
     }
@@ -1798,14 +1884,48 @@ function createServer() {
         fieldName: z
           .string()
           .describe('Field API name, for example Federal_Tax_ID_No__c'),
+        objectName: z
+          .string()
+          .optional()
+          .describe(
+            'Object API name that owns the field, for example Opportunity. Recommended: the same field name can exist on several objects.'
+          ),
       }),
       annotations: {
         readOnlyHint: true,
       },
     },
-    async ({ fieldName }) => {
+    async ({ fieldName, objectName }) => {
       const conn = await getSalesforceConnection();
-      const safe = escapeSoql(fieldName);
+
+      // MetadataComponentDependency only accepts Id columns in WHERE
+      // (filtering on the *Name columns fails with "... is unknown"), so
+      // resolve the custom field Id first.
+      const developerName = escapeSoql(fieldName.replace(/__c$/i, ''));
+      const objectFilter = objectName
+        ? ` AND EntityDefinition.QualifiedApiName = '${escapeSoql(objectName)}'`
+        : '';
+
+      const fields = await conn.tooling.query(`
+        SELECT Id,
+               DeveloperName,
+               EntityDefinition.QualifiedApiName
+        FROM CustomField
+        WHERE DeveloperName = '${developerName}'${objectFilter}
+      `);
+
+      const fieldRecords = fields.records as any[];
+
+      if (fieldRecords.length === 0) {
+        return jsonResult({
+          fieldName,
+          objectName,
+          error:
+            'No custom field found. Standard fields cannot be looked up through MetadataComponentDependency here; check the spelling or pass objectName.',
+        });
+      }
+
+      const ids = fieldRecords.map((record) => `'${record.Id}'`).join(', ');
 
       const result = await conn.tooling.query(`
         SELECT MetadataComponentId,
@@ -1815,12 +1935,18 @@ function createServer() {
                RefMetadataComponentName,
                RefMetadataComponentType
         FROM MetadataComponentDependency
-        WHERE RefMetadataComponentName = '${safe}'
-           OR MetadataComponentName = '${safe}'
+        WHERE RefMetadataComponentId IN (${ids})
         LIMIT 2000
       `);
 
-      return jsonResult(result);
+      return jsonResult({
+        fields: fieldRecords.map((record) => ({
+          id: record.Id,
+          developerName: record.DeveloperName,
+          object: record.EntityDefinition?.QualifiedApiName,
+        })),
+        references: result,
+      });
     }
   );
 
@@ -2538,18 +2664,11 @@ server.registerTool(
       // ------------------------------------------------------------
 
       try {
-        output.dependencies = await conn.tooling.query(`
-          SELECT MetadataComponentId,
-                 MetadataComponentName,
-                 MetadataComponentType,
-                 RefMetadataComponentId,
-                 RefMetadataComponentName,
-                 RefMetadataComponentType
-          FROM MetadataComponentDependency
-          WHERE RefMetadataComponentName = '${safeObject}'
-             OR MetadataComponentName = '${safeObject}'
-          LIMIT 2000
-        `);
+        output.dependencies = await queryDependenciesByName(
+          conn,
+          objectName,
+          'exact'
+        );
       } catch (error) {
         output.dependenciesError = normalizeSalesforceError(error);
       }
@@ -3291,20 +3410,11 @@ server.registerTool(
       // ------------------------------------------------------------
 
       try {
-        output.metadataDependencies = await conn.tooling.query(`
-          SELECT MetadataComponentId,
-                 MetadataComponentName,
-                 MetadataComponentType,
-                 RefMetadataComponentId,
-                 RefMetadataComponentName,
-                 RefMetadataComponentType
-          FROM MetadataComponentDependency
-          WHERE MetadataComponentName = '${safe}'
-             OR RefMetadataComponentName = '${safe}'
-             OR MetadataComponentName LIKE '%${safe}%'
-             OR RefMetadataComponentName LIKE '%${safe}%'
-          LIMIT 2000
-        `);
+        output.metadataDependencies = await queryDependenciesByName(
+          conn,
+          search,
+          'contains'
+        );
       } catch (error) {
         output.metadataDependenciesError =
           normalizeSalesforceError(error);
